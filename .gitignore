@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Database (and pre-migration backups)
+data/
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS
+.DS_Store
