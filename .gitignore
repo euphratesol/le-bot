@@ -1,6 +1,14 @@
 # Secrets
 .env
 
+# Local phrase configuration
+phrases.json
+
+# Local response images - keep the
+# directory itself, ignore its contents
+images/*
+!images/.gitkeep
+
 # Database (and pre-migration backups)
 data/
 *.bak
@@ -12,3 +20,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# IDE
+.idea

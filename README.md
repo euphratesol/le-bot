@@ -5,15 +5,15 @@ A small Discord bot for a few private servers, built with [discord.py](https://d
 Current features:
 
 - Slash commands (synced instantly to the servers in `GUILD_IDS`)
-- Phrase reactions — replies when messages contain configured trigger words
+- Phrase reactions - replies when messages contain configured trigger words
 - Per-user, per-server counters and an interaction log, stored in SQLite
 
 ## Requirements
 
 - Python 3.12
 - A Discord application with a bot token, with **Message Content Intent**
-  enabled (Developer Portal → your app → Bot → Privileged Gateway Intents) —
-  required for phrase reactions and `c!` prefix commands.
+  enabled (Developer Portal → your app → Bot → Privileged Gateway Intents) -
+  required for phrase reactions and `n!` prefix commands.
 
 ## Setup
 
@@ -34,7 +34,12 @@ Current features:
 2. Copy `.env.example` to `.env` and fill in your bot token and the guild
    (server) IDs you want slash commands synced to.
 
-3. Run the bot:
+3. Copy `phrases.example.json` to `phrases.json` and configure the phrases
+   the bot reacts to, counts, and answers as `n!` commands. Like any `.env`,
+   this file stays out of git - edit it freely per machine and restart the
+   bot to apply changes.
+ 
+4. Run the bot:
 
    ```sh
    python -m bot
@@ -62,7 +67,7 @@ State lives in a SQLite file (default `data/bot.db`, override with `DB_PATH`).
 Migrations are numbered SQL files in `bot/migrations/` and are forward-only.
 On startup the bot compares the database's `PRAGMA user_version` against the
 migration files and applies anything newer, in order. Before applying to an
-existing database it snapshots the file to `<db>.pre-vNNN.bak` — rolling back
+existing database it snapshots the file to `<db>.pre-vNNN.bak` - rolling back
 a migration means stopping the bot and restoring that file.
 
 To change the schema: add the next numbered file, e.g.

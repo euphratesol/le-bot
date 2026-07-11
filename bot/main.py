@@ -5,11 +5,12 @@ import discord
 from discord.ext import commands
 
 from bot import db
-from bot.config import Config, load_config
+from bot.config import Config, load_config, load_phrases
 
 log = logging.getLogger(__name__)
 
 INITIAL_EXTENSIONS = [
+    "bot.cogs.counting",
     "bot.cogs.general",
     "bot.cogs.reactions",
 ]
@@ -20,9 +21,10 @@ class LeBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
 
-        super().__init__(command_prefix="c!", intents=intents)
+        super().__init__(command_prefix="n!", intents=intents)
         self.config = config
         self.db: aiosqlite.Connection | None = None
+        self.phrases = load_phrases(config.phrases_path)
 
     async def setup_hook(self) -> None:
         self.db = await db.connect(self.config.db_path)
@@ -43,6 +45,15 @@ class LeBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id: %s)", self.user, self.user.id)
 
+    async def on_command_error(
+        self,
+        ctx: commands.Context,
+        error: commands.CommandError
+    ) -> None:
+        if isinstance(error, commands.CommandNotFound):
+            return
+        log.error("Error in command %s", ctx.command, exc_info=error)
+
     async def close(self) -> None:
         if self.db is not None:
             await self.db.close()
@@ -52,4 +63,4 @@ class LeBot(commands.Bot):
 def run() -> None:
     config = load_config()
     bot = LeBot(config)
-    bot.run(config.token, log_level=logging.INFO)
+    bot.run(config.token, log_level=logging.INFO, root_logger=True)

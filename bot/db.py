@@ -52,7 +52,11 @@ async def _apply_migrations(db: aiosqlite.Connection, path: Path) -> None:
 
 
 async def increment_counter(
-    db: aiosqlite.Connection, guild_id: int, user_id: int, name: str, by: int = 1
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int,
+    name: str,
+    by: int = 1,
 ) -> int:
     """Add to a per-user counter and return its new value."""
     async with db.execute(
@@ -68,6 +72,60 @@ async def increment_counter(
         value = (await cursor.fetchone())[0]
     await db.commit()
     return value
+
+
+async def get_counter(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int,
+    name: str,
+) -> int:
+    async with db.execute(
+        """SELECT value 
+           FROM counters 
+           WHERE guild_id = ? 
+             AND user_id = ? 
+             AND name = ?""",
+        (guild_id, user_id, name),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
+async def get_reaction_blocked_channels(db: aiosqlite.Connection) -> set[int]:
+    """All blocked channel IDs across every guild, for fast in-memory checks."""
+    async with db.execute("SELECT channel_id FROM reaction_blocked_channels") as cursor:
+        return {row[0] for row in await cursor.fetchall()}
+
+
+async def block_reaction_channel(
+        db: aiosqlite.Connection,
+        guild_id: int,
+        channel_id: int,
+) -> None:
+    await db.execute(
+        "INSERT OR IGNORE INTO reaction_blocked_channels (channel_id, guild_id) VALUES (?, ?)",
+        (channel_id, guild_id),
+    )
+    await db.commit()
+
+
+async def unblock_reaction_channel(db: aiosqlite.Connection, channel_id: int) -> None:
+    await db.execute(
+        "DELETE FROM reaction_blocked_channels WHERE channel_id = ?", (channel_id,)
+    )
+    await db.commit()
+
+
+async def list_reaction_blocked_channels(
+        db: aiosqlite.Connection,
+        guild_id: int,
+) -> list[int]:
+    async with db.execute(
+        "SELECT channel_id FROM reaction_blocked_channels WHERE guild_id = ?",
+        (guild_id,)
+    ) as cursor:
+        return [row[0] for row in await cursor.fetchall()]
 
 
 async def log_event(

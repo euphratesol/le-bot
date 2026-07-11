@@ -20,7 +20,7 @@ class General(commands.Cog):
             self.bot.db, interaction.guild_id or 0, interaction.user.id, "ping"
         )
         await interaction.response.send_message(
-            f"Pong! ({latency_ms}ms) — that's ping #{count} from you."
+            f"Pong ({latency_ms}ms) - that's ping #{count} from you."
         )
 
 

@@ -1,0 +1,13 @@
+{
+  "counted_phrases": [
+    "bong"
+  ],
+  "phrase_responses": {
+    "cheems": "cheems",
+    "doge": { "text": "wow", "image":  "doge.png" },
+    "discheesed": { "image":  "discheesed.png" }
+  },
+  "command_responses": {
+    "cheems": "He's dead"
+  }
+}
