@@ -21,7 +21,7 @@ class LeBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
 
-        super().__init__(command_prefix="n!", intents=intents)
+        super().__init__(command_prefix="n!", intents=intents, help_command=None)
         self.config = config
         self.db: aiosqlite.Connection | None = None
         self.phrases = load_phrases(config.phrases_path)
