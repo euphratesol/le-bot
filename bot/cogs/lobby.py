@@ -25,6 +25,7 @@ MAX_AVATARS = 10
 AVATAR_CACHE_LIMIT = 100
 STRIP_FILENAME = "lobby.png"
 MAX_KICK_BUTTONS = 15
+LOBBIES = {"valorant": "batsignal"}
 
 
 def _game_label(row: aiosqlite.Row) -> str:
@@ -935,6 +936,71 @@ class Lobby(commands.Cog):
     ) -> None:
         # If someone manually deletes a lobby message, drop the lobby with it.
         await db.delete_lobby_by_message(self.bot.db, payload.message_id)
+
+    async def _start_lobby(
+        self,
+        channel: discord.abc.Messageable,
+        guild_id: int,
+        game: aiosqlite.Row,
+        created_by: int,
+    ) -> aiosqlite.Row | None:
+        view, strip = await self._lobby_view(game, [])
+        try:
+            posted = await channel.send(
+                view=view, **({"files": [strip]} if strip else {})
+            )
+        except discord.HTTPException:
+            return None
+        try:
+            lobby_id = await db.create_lobby(
+                self.bot.db, game["id"], guild_id, channel.id, posted.id, created_by
+            )
+        except sqlite3.IntegrityError:
+            try:
+                await posted.delete()
+            except discord.HTTPException:
+                pass
+            return await db.get_lobby_for_game(self.bot.db, game["id"])
+        await db.log_event(
+            self.bot.db, guild_id, created_by, "lobby_open", game["name"]
+        )
+        return await db.get_lobby(self.bot.db, lobby_id)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or message.guild is None:
+            return
+        emoji = discord.PartialEmoji.from_str(message.content.strip())
+        if not emoji.is_custom_emoji():
+            return
+        game_name = next(
+            (name for name, summon in LOBBIES.items() if summon == emoji.name), None
+        )
+        if game_name is None:
+            return
+        games = await db.list_lobby_games(self.bot.db, message.guild.id)
+        game = next(
+            (g for g in games if g["name"].lower() == game_name.lower()), None
+        )
+        if game is None:
+            return
+        lobby = await db.get_lobby_for_game(self.bot.db, game["id"])
+        if lobby is None:
+            lobby = await self._start_lobby(
+                message.channel, message.guild.id, game, message.author.id
+            )
+            if lobby is None:
+                return
+        added = await db.add_lobby_member(
+            self.bot.db, lobby["id"], message.author.id, message.author.id
+        )
+        if not added:
+            return
+        await db.log_event(
+            self.bot.db, lobby["guild_id"], message.author.id,
+            "lobby_member_add", f"{lobby['name']}:{message.author.id}",
+        )
+        await self.after_member_change(lobby)
 
 
 async def setup(bot: LeBot) -> None:
