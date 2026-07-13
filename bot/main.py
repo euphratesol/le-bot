@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 INITIAL_EXTENSIONS = [
     "bot.cogs.counting",
     "bot.cogs.general",
+    "bot.cogs.lobby",
     "bot.cogs.reactions",
 ]
 
