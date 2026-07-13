@@ -283,7 +283,6 @@ async def move_lobby(
     channel_id: int,
     message_id: int,
 ) -> None:
-    """Point a lobby at a new message (re-open moves and auto-bumps)."""
     await db.execute(
         "UPDATE lobbies SET channel_id = ?, message_id = ? WHERE id = ?",
         (channel_id, message_id, lobby_id),
@@ -330,7 +329,6 @@ async def add_lobby_member(
     user_id: int,
     added_by: int,
 ) -> bool:
-    """Add a user to a lobby. Returns False if they were already in it."""
     cursor = await db.execute(
         "INSERT OR IGNORE INTO lobby_members (lobby_id, user_id, added_by) VALUES (?, ?, ?)",
         (lobby_id, user_id, added_by),
@@ -353,7 +351,6 @@ async def remove_lobby_member(
 
 
 async def clear_lobby_members(db: aiosqlite.Connection, lobby_id: int) -> None:
-    """Wipe a lobby's members and re-arm its full-lobby announcement."""
     await db.execute("DELETE FROM lobby_members WHERE lobby_id = ?", (lobby_id,))
     await db.execute("UPDATE lobbies SET announced = 0 WHERE id = ?", (lobby_id,))
     await db.commit()
@@ -368,7 +365,6 @@ async def list_lobby_members(db: aiosqlite.Connection, lobby_id: int) -> list[in
 
 
 async def mark_lobby_announced(db: aiosqlite.Connection, lobby_id: int) -> bool:
-    """Flip the announced flag. Returns False if it was already set."""
     cursor = await db.execute(
         "UPDATE lobbies SET announced = 1 WHERE id = ? AND announced = 0", (lobby_id,)
     )

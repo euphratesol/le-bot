@@ -1,10 +1,14 @@
 import logging
+import re
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
 import aiosqlite
 import discord
 from discord import app_commands
+from discord.app_commands import allowed_contexts
 from discord.ext import commands
+from PIL import Image, ImageDraw
 
 from bot import db
 from bot.main import LeBot
@@ -13,16 +17,37 @@ log = logging.getLogger(__name__)
 
 PING_COOLDOWN = timedelta(seconds=30)
 MAX_PING_MENTIONS = 50
-EMPTY_SLOT = "—"
+AVATAR_SIZE = 64
+AVATAR_PAD = 8
+MAX_AVATARS = 10
+AVATAR_CACHE_LIMIT = 100
+STRIP_FILENAME = "lobby.png"
+MAX_KICK_BUTTONS = 15
+KICK_LABEL_LENGTH = 18
 
 
 def _game_label(row: aiosqlite.Row) -> str:
-    """Display name for a game/lobby row, with its emoji if one is set."""
     return f"{row['emoji']} {row['name']}" if row["emoji"] else row["name"]
 
 
+def _compose_avatar_strip(avatars: list[bytes]) -> bytes:
+    size, pad = AVATAR_SIZE, AVATAR_PAD
+    canvas = Image.new(
+        "RGBA",
+        (pad + len(avatars) * (size + pad), size + 2 * pad),
+        (0, 0, 0, 0),
+    )
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    for slot, blob in enumerate(avatars):
+        head = Image.open(BytesIO(blob)).convert("RGBA").resize((size, size))
+        canvas.paste(head, (pad + slot * (size + pad), pad), mask)
+    out = BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
+
+
 def _parse_emoji(raw: str) -> str | None:
-    """Normalise an emoji input, or None if it doesn't look like one."""
     emoji = discord.PartialEmoji.from_str(raw.strip())
     if emoji.is_custom_emoji():
         return str(emoji)
@@ -32,6 +57,56 @@ def _parse_emoji(raw: str) -> str | None:
     if name and len(name) <= 8 and not any(ch.isalnum() and ch.isascii() for ch in name):
         return name
     return None
+
+
+class KickButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"lobby:kick:(?P<user_id>[0-9]+)",
+):
+    def __init__(
+        self,
+        user_id: int,
+        label: str = "x",
+        row: int = 2
+    ):
+        super().__init__(
+            discord.ui.Button(
+                style=discord.ButtonStyle.secondary,
+                label=label,
+                custom_id=f"lobby:kick:{user_id}",
+                row=row,
+            )
+        )
+        self.user_id = user_id
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: "re.Match[str]",
+    ) -> "KickButton":
+        return cls(int(match["user_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog: "Lobby | None" = interaction.client.get_cog("Lobby")
+        if cog is None:
+            return
+        lobby = await cog.lobby_for(interaction)
+        if lobby is None:
+            return
+        removed = await db.remove_lobby_member(
+            cog.bot.db, lobby["id"], self.user_id
+        )
+        if not removed:
+            await interaction.response.send_message(
+                f"<@{self.user_id}> isn't in this lobby anymore.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            return
+        await interaction.response.defer()
+        await cog.after_member_change(lobby)
 
 
 class LobbyView(discord.ui.View):
@@ -47,7 +122,7 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
-        placeholder="➕ Add a player…",
+        placeholder="Add a player...",
         custom_id="lobby:add_select",
         row=0,
     )
@@ -60,11 +135,6 @@ class LobbyView(discord.ui.View):
         if lobby is None:
             return
         user = select.values[0]
-        if user.bot:
-            await interaction.response.send_message(
-                "Bots can't join a lobby.", ephemeral=True
-            )
-            return
         added = await db.add_lobby_member(
             self.cog.bot.db, lobby["id"], user.id, interaction.user.id
         )
@@ -81,9 +151,7 @@ class LobbyView(discord.ui.View):
     @discord.ui.button(
         label="Join", style=discord.ButtonStyle.success, custom_id="lobby:join", row=1
     )
-    async def join(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def join(self, interaction: discord.Interaction) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -101,9 +169,7 @@ class LobbyView(discord.ui.View):
     @discord.ui.button(
         label="Leave", style=discord.ButtonStyle.secondary, custom_id="lobby:leave", row=1
     )
-    async def leave(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def leave(self, interaction: discord.Interaction) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -119,11 +185,12 @@ class LobbyView(discord.ui.View):
         await self.cog.after_member_change(lobby)
 
     @discord.ui.button(
-        label="Ping", style=discord.ButtonStyle.primary, custom_id="lobby:ping", row=1
+        label="Ping",
+        style=discord.ButtonStyle.primary,
+        custom_id="lobby:ping",
+        row=1
     )
-    async def ping(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def ping(self, interaction: discord.Interaction) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -135,8 +202,7 @@ class LobbyView(discord.ui.View):
             remaining = PING_COOLDOWN - (datetime.now(timezone.utc) - last)
             if remaining > timedelta(0):
                 await interaction.response.send_message(
-                    f"The lobby was pinged recently — try again in "
-                    f"{max(1, int(remaining.total_seconds()))}s.",
+                    f"Ping cooldown, try again in {max(1, int(remaining.total_seconds()))}s.",
                     ephemeral=True,
                 )
                 return
@@ -149,7 +215,7 @@ class LobbyView(discord.ui.View):
         ]
         if not targets:
             await interaction.response.send_message(
-                f"No one to ping for {_game_label(lobby)} — an admin can add "
+                f"No one to ping for {_game_label(lobby)} - an admin can add "
                 "people with `/game pinglist add`.",
                 ephemeral=True,
             )
@@ -158,7 +224,7 @@ class LobbyView(discord.ui.View):
         mentions = [f"<@{uid}>" for uid in targets]
         first, rest = mentions[:MAX_PING_MENTIONS], mentions[MAX_PING_MENTIONS:]
         await interaction.response.send_message(
-            f"{' '.join(first)} — a {_game_label(lobby)} lobby is looking for players!"
+            f"{' '.join(first)}"
         )
         while rest:
             chunk, rest = rest[:MAX_PING_MENTIONS], rest[MAX_PING_MENTIONS:]
@@ -172,9 +238,7 @@ class LobbyView(discord.ui.View):
     @discord.ui.button(
         label="Clear", style=discord.ButtonStyle.danger, custom_id="lobby:clear", row=1
     )
-    async def clear(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def clear(self, interaction: discord.Interaction) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -213,12 +277,12 @@ class Lobby(commands.Cog):
     def __init__(self, bot: LeBot):
         self.bot = bot
         self.view = LobbyView(self)
+        self._avatar_cache: dict[str, bytes] = {}
 
     async def cog_load(self) -> None:
         # One persistent view handles the buttons on every lobby message.
         self.bot.add_view(self.view)
-
-    # --- shared helpers -------------------------------------------------
+        self.bot.add_dynamic_items(KickButton)
 
     async def game_autocomplete(
         self, interaction: discord.Interaction, current: str
@@ -237,7 +301,7 @@ class Lobby(commands.Cog):
         game = await db.get_lobby_game(self.bot.db, interaction.guild_id, name)
         if game is None:
             await interaction.response.send_message(
-                f"There's no game called **{name}** here — an admin can add it "
+                f"There's no game called **{name}** here - an admin can add it "
                 "with `/game add`.",
                 ephemeral=True,
             )
@@ -267,12 +331,64 @@ class Lobby(commands.Cog):
                 return None
         return channel
 
+    async def _resolve_user(self, user_id: int) -> discord.User | None:
+        user = self.bot.get_user(user_id)
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(user_id)
+            except discord.HTTPException:
+                return None
+        return user
+
+    async def _member_view(self, member_ids: list[int]) -> LobbyView:
+        view = LobbyView(self)
+        for slot, user_id in enumerate(member_ids[:MAX_KICK_BUTTONS]):
+            user = await self._resolve_user(user_id)
+            name = user.display_name if user else str(user_id)
+            view.add_item(
+                KickButton(
+                    user_id,
+                    label=f"x {name[:KICK_LABEL_LENGTH]}",
+                    row=2 + slot // 5,
+                )
+            )
+        return view
+
+    async def _avatar_bytes(self, user_id: int) -> bytes | None:
+        user = await self._resolve_user(user_id)
+        if user is None:
+            return None
+        asset = user.display_avatar.replace(size=128, format="png")
+        cached = self._avatar_cache.get(asset.url)
+        if cached is not None:
+            return cached
+        try:
+            data = await asset.read()
+        except discord.HTTPException:
+            return None
+        if len(self._avatar_cache) > AVATAR_CACHE_LIMIT:
+            self._avatar_cache.pop(next(iter(self._avatar_cache)))
+        self._avatar_cache[asset.url] = data
+        return data
+
+    async def _avatar_strip(self, member_ids: list[int]) -> discord.File | None:
+        avatars = []
+        for user_id in member_ids[:MAX_AVATARS]:
+            blob = await self._avatar_bytes(user_id)
+            if blob is not None:
+                avatars.append(blob)
+        if not avatars:
+            return None
+        return discord.File(
+            BytesIO(_compose_avatar_strip(avatars)), filename=STRIP_FILENAME
+        )
+
     @staticmethod
     def _build_embed(game: aiosqlite.Row, member_ids: list[int]) -> discord.Embed:
         party_size = game["party_size"]
         lines = [f"## {_game_label(game)} lobby"]
         for slot in range(max(party_size, len(member_ids))):
-            member = f"<@{member_ids[slot]}>" if slot < len(member_ids) else EMPTY_SLOT
+            member = f"<@{member_ids[slot]}>" if slot < len(member_ids) else ""
             lines.append(f"{slot + 1}. {member}")
         full = len(member_ids) >= party_size
         embed = discord.Embed(
@@ -282,21 +398,34 @@ class Lobby(commands.Cog):
         embed.set_footer(text=f"{len(member_ids)}/{party_size} players")
         return embed
 
+    async def _lobby_payload(
+        self,
+        game: aiosqlite.Row,
+        member_ids: list[int]
+    ) -> tuple[discord.Embed, discord.File | None]:
+        embed = self._build_embed(game, member_ids)
+        strip = await self._avatar_strip(member_ids)
+        if strip is not None:
+            embed.set_image(url=f"attachment://{STRIP_FILENAME}")
+        return embed, strip
+
     async def render(self, lobby: aiosqlite.Row, *, bump: bool) -> None:
         """Redraw a lobby message; on member changes, keep it at the bottom.
 
-        `lobby` may be stale on everything except id/game fields — channel
+        `lobby` may be stale on everything except id/game fields - channel
         and message ids are what they were when the caller fetched the row.
         """
         channel = await self._get_channel(lobby["channel_id"])
         if channel is None:
             return
         members = await db.list_lobby_members(self.bot.db, lobby["id"])
-        embed = self._build_embed(lobby, members)
+        embed, strip = await self._lobby_payload(lobby, members)
+        view = await self._member_view(members)
 
+        send_kwargs = {"files": [strip]} if strip else {}
         if bump and channel.last_message_id != lobby["message_id"]:
             try:
-                message = await channel.send(embed=embed, view=self.view)
+                message = await channel.send(embed=embed, view=view, **send_kwargs)
             except discord.HTTPException:
                 return
             # Repoint the DB before deleting, so the raw-delete listener
@@ -309,7 +438,11 @@ class Lobby(commands.Cog):
             return
 
         try:
-            await channel.get_partial_message(lobby["message_id"]).edit(embed=embed)
+            await channel.get_partial_message(lobby["message_id"]).edit(
+                embed=embed,
+                view = view,
+                attachments=[strip] if strip else []
+            )
         except discord.NotFound:
             await db.delete_lobby(self.bot.db, lobby["id"])
         except discord.HTTPException:
@@ -335,8 +468,6 @@ class Lobby(commands.Cog):
                 )
         await self.render(lobby, bump=True)
 
-    # --- /lobby ---------------------------------------------------------
-
     @lobby_group.command(description="Open the lobby for a game (or bring it here).")
     @app_commands.autocomplete(game=game_autocomplete)
     async def open(self, interaction: discord.Interaction, game: str) -> None:
@@ -351,8 +482,12 @@ class Lobby(commands.Cog):
                 self.bot.db, lobby["id"], interaction.user.id, interaction.user.id
             )
             members = await db.list_lobby_members(self.bot.db, lobby["id"])
+            embed, strip = await self._lobby_payload(lobby, members)
+            send_kwargs = {"files": [strip]} if strip else {}
             await interaction.response.send_message(
-                embed=self._build_embed(lobby, members), view=self.view
+                embed=embed,
+                view=await self._member_view(members),
+                **send_kwargs,
             )
             message = await interaction.original_response()
             old_channel_id, old_message_id = lobby["channel_id"], lobby["message_id"]
@@ -364,9 +499,13 @@ class Lobby(commands.Cog):
                 except discord.HTTPException:
                     pass
         else:
+            members = [interaction.user.id]
+            embed, strip = await self._lobby_payload(game_row, members)
+            send_kwargs = {"files": [strip]} if strip else {}
             await interaction.response.send_message(
-                embed=self._build_embed(game_row, [interaction.user.id]),
-                view=self.view,
+                embed=embed,
+                view=await self._member_view(members),
+                **send_kwargs
             )
             message = await interaction.original_response()
             lobby_id = await db.create_lobby(
@@ -435,7 +574,9 @@ class Lobby(commands.Cog):
             )
             try:
                 await channel.get_partial_message(lobby["message_id"]).edit(
-                    embed=closed, view=None
+                    embed=closed,
+                    view=None,
+                    attachments=[],
                 )
             except discord.HTTPException:
                 pass
@@ -444,13 +585,11 @@ class Lobby(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    # --- /game ------------------------------------------------------------
-
     @game_group.command(description="Add a game that lobbies can be opened for.")
     @app_commands.describe(
-        name="Name of the game (used in commands).",
+        name="Name of the game.",
         party_size="How many players make a full lobby.",
-        emoji="Optional emoji shown with the game (custom server emojis work).",
+        emoji="Optional emoji shown with the game.",
     )
     async def add(
         self,
@@ -505,7 +644,7 @@ class Lobby(commands.Cog):
                 return
         if party_size is None and parsed is None:
             await interaction.response.send_message(
-                "Nothing to change — pass a party size and/or an emoji.",
+                "Nothing to change - pass a party size and/or an emoji.",
                 ephemeral=True,
             )
             return
@@ -542,16 +681,14 @@ class Lobby(commands.Cog):
     async def list_games(self, interaction: discord.Interaction) -> None:
         games = await db.list_lobby_games(self.bot.db, interaction.guild_id)
         if not games:
-            message = "No games set up yet — add one with `/game add`."
+            message = "No games set up yet."
         else:
             message = "\n".join(
-                f"- **{_game_label(game)}** — party of {game['party_size']}, "
+                f"- **{_game_label(game)}** - party of {game['party_size']}, "
                 f"{game['ping_list_size']} on the ping list"
                 for game in games
             )
         await interaction.response.send_message(message, ephemeral=True)
-
-    # --- /game pinglist ---------------------------------------------------
 
     @pinglist_group.command(name="add", description="Add someone to a game's ping list.")
     @app_commands.autocomplete(game=game_autocomplete)
@@ -560,11 +697,6 @@ class Lobby(commands.Cog):
     ) -> None:
         game_row = await self._resolve_game(interaction, game)
         if game_row is None:
-            return
-        if user.bot:
-            await interaction.response.send_message(
-                "Bots don't need pinging.", ephemeral=True
-            )
             return
         added = await db.add_to_ping_list(self.bot.db, game_row["id"], user.id)
         message = (
@@ -611,8 +743,6 @@ class Lobby(commands.Cog):
         await interaction.response.send_message(
             message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
         )
-
-    # --- housekeeping -------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_raw_message_delete(
