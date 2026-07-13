@@ -23,7 +23,6 @@ MAX_AVATARS = 10
 AVATAR_CACHE_LIMIT = 100
 STRIP_FILENAME = "lobby.png"
 MAX_KICK_BUTTONS = 15
-KICK_LABEL_LENGTH = 18
 
 
 def _game_label(row: aiosqlite.Row) -> str:
@@ -63,18 +62,12 @@ class KickButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"lobby:kick:(?P<user_id>[0-9]+)",
 ):
-    def __init__(
-        self,
-        user_id: int,
-        label: str = "x",
-        row: int = 2
-    ):
+    def __init__(self, user_id: int, label: str = "x"):
         super().__init__(
             discord.ui.Button(
                 style=discord.ButtonStyle.secondary,
                 label=label,
                 custom_id=f"lobby:kick:{user_id}",
-                row=row,
             )
         )
         self.user_id = user_id
@@ -109,22 +102,17 @@ class KickButton(
         await cog.after_member_change(lobby)
 
 
-class LobbyView(discord.ui.View):
-    """Persistent controls attached to every lobby message.
-
-    Static custom_ids + timeout=None let one instance serve all lobbies
-    across restarts; callbacks find their lobby by the message they're on.
-    """
+class AddPlayerRow(discord.ui.ActionRow):
+    """The 'Add a player...' user picker on every lobby message."""
 
     def __init__(self, cog: "Lobby"):
-        super().__init__(timeout=None)
+        super().__init__()
         self.cog = cog
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
         placeholder="Add a player...",
         custom_id="lobby:add_select",
-        row=0,
     )
     async def add_player(
         self,
@@ -148,10 +136,20 @@ class LobbyView(discord.ui.View):
         await interaction.response.defer()
         await self.cog.after_member_change(lobby)
 
+
+class LobbyControls(discord.ui.ActionRow):
+    """The Join/Leave/Ping/Clear buttons on every lobby message."""
+
+    def __init__(self, cog: "Lobby"):
+        super().__init__()
+        self.cog = cog
+
     @discord.ui.button(
-        label="Join", style=discord.ButtonStyle.success, custom_id="lobby:join", row=1
+        label="Join", style=discord.ButtonStyle.success, custom_id="lobby:join"
     )
-    async def join(self, interaction: discord.Interaction) -> None:
+    async def join(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -167,9 +165,11 @@ class LobbyView(discord.ui.View):
         await self.cog.after_member_change(lobby)
 
     @discord.ui.button(
-        label="Leave", style=discord.ButtonStyle.secondary, custom_id="lobby:leave", row=1
+        label="Leave", style=discord.ButtonStyle.secondary, custom_id="lobby:leave"
     )
-    async def leave(self, interaction: discord.Interaction) -> None:
+    async def leave(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -188,9 +188,10 @@ class LobbyView(discord.ui.View):
         label="Ping",
         style=discord.ButtonStyle.primary,
         custom_id="lobby:ping",
-        row=1
     )
-    async def ping(self, interaction: discord.Interaction) -> None:
+    async def ping(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -236,9 +237,11 @@ class LobbyView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Clear", style=discord.ButtonStyle.danger, custom_id="lobby:clear", row=1
+        label="Clear", style=discord.ButtonStyle.danger, custom_id="lobby:clear"
     )
-    async def clear(self, interaction: discord.Interaction) -> None:
+    async def clear(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
@@ -251,6 +254,79 @@ class LobbyView(discord.ui.View):
         await db.log_event(
             self.cog.bot.db, lobby["guild_id"], interaction.user.id,
             "lobby_clear", lobby["name"],
+        )
+
+
+class LobbyLayout(discord.ui.LayoutView):
+    """The whole lobby message: member rows with inline x buttons, the
+    avatar strip, and the add/control rows.
+
+    Built fresh for each render. A bare LobbyLayout(cog) is registered as
+    the persistent template so the static custom_ids survive restarts
+    (KickButton dispatch is covered separately by add_dynamic_items).
+    """
+
+    # Discord caps a message at 40 components, nested ones included. The
+    # fixed parts (container, heading, footer, gallery, two action rows,
+    # select, four buttons) cost 11; a member row with an inline x costs 3
+    # (section + text + button) while a plain text row costs 1.
+    ROW_BUDGET = 29
+
+    def __init__(
+        self,
+        cog: "Lobby",
+        game: aiosqlite.Row | None = None,
+        member_ids: list[int] | None = None,
+        has_strip: bool = False,
+    ):
+        super().__init__(timeout=None)
+        if game is not None:
+            self.add_item(self._container(cog, game, member_ids or [], has_strip))
+        self.add_item(AddPlayerRow(cog))
+        self.add_item(LobbyControls(cog))
+
+    @staticmethod
+    def _container(
+        cog: "Lobby",
+        game: aiosqlite.Row,
+        members: list[int],
+        has_strip: bool,
+    ) -> discord.ui.Container:
+        party_size = game["party_size"]
+        slots = min(max(party_size, len(members)), LobbyLayout.ROW_BUDGET)
+        max_inline = min(
+            MAX_KICK_BUTTONS, max(0, (LobbyLayout.ROW_BUDGET - slots) // 2)
+        )
+
+        rows: list[discord.ui.Item] = [
+            discord.ui.TextDisplay(f"## {_game_label(game)} lobby")
+        ]
+        for slot in range(slots):
+            if slot < len(members):
+                line = f"{slot + 1}. <@{members[slot]}>"
+                if slot < max_inline:
+                    rows.append(
+                        discord.ui.Section(
+                            discord.ui.TextDisplay(line),
+                            accessory=KickButton(members[slot]),
+                        )
+                    )
+                else:
+                    rows.append(discord.ui.TextDisplay(line))
+            else:
+                rows.append(discord.ui.TextDisplay(f"{slot + 1}."))
+        if has_strip:
+            rows.append(
+                discord.ui.MediaGallery(
+                    discord.MediaGalleryItem(f"attachment://{STRIP_FILENAME}")
+                )
+            )
+        rows.append(discord.ui.TextDisplay(f"-# {len(members)}/{party_size} players"))
+
+        full = len(members) >= party_size
+        return discord.ui.Container(
+            *rows,
+            accent_colour=discord.Colour.green() if full else discord.Colour.blurple(),
         )
 
 
@@ -276,11 +352,12 @@ class Lobby(commands.Cog):
 
     def __init__(self, bot: LeBot):
         self.bot = bot
-        self.view = LobbyView(self)
+        self.view = LobbyLayout(self)
         self._avatar_cache: dict[str, bytes] = {}
 
     async def cog_load(self) -> None:
-        # One persistent view handles the buttons on every lobby message.
+        # One persistent template handles the static components on every
+        # lobby message; DynamicItem registration covers the x buttons.
         self.bot.add_view(self.view)
         self.bot.add_dynamic_items(KickButton)
 
@@ -316,8 +393,12 @@ class Lobby(commands.Cog):
             await interaction.response.send_message(
                 "This lobby is no longer active.", ephemeral=True
             )
+            # A layout message must keep at least one component, so swap in
+            # a dead-end text instead of stripping the view entirely.
+            stale = discord.ui.LayoutView(timeout=None)
+            stale.add_item(discord.ui.TextDisplay("*This lobby is no longer active.*"))
             try:
-                await interaction.message.edit(view=None)
+                await interaction.message.edit(view=stale)
             except discord.HTTPException:
                 pass
         return lobby
@@ -339,20 +420,6 @@ class Lobby(commands.Cog):
             except discord.HTTPException:
                 return None
         return user
-
-    async def _member_view(self, member_ids: list[int]) -> LobbyView:
-        view = LobbyView(self)
-        for slot, user_id in enumerate(member_ids[:MAX_KICK_BUTTONS]):
-            user = await self._resolve_user(user_id)
-            name = user.display_name if user else str(user_id)
-            view.add_item(
-                KickButton(
-                    user_id,
-                    label=f"x {name[:KICK_LABEL_LENGTH]}",
-                    row=2 + slot // 5,
-                )
-            )
-        return view
 
     async def _avatar_bytes(self, user_id: int) -> bytes | None:
         user = await self._resolve_user(user_id)
@@ -383,31 +450,14 @@ class Lobby(commands.Cog):
             BytesIO(_compose_avatar_strip(avatars)), filename=STRIP_FILENAME
         )
 
-    @staticmethod
-    def _build_embed(game: aiosqlite.Row, member_ids: list[int]) -> discord.Embed:
-        party_size = game["party_size"]
-        lines = [f"## {_game_label(game)} lobby"]
-        for slot in range(max(party_size, len(member_ids))):
-            member = f"<@{member_ids[slot]}>" if slot < len(member_ids) else ""
-            lines.append(f"{slot + 1}. {member}")
-        full = len(member_ids) >= party_size
-        embed = discord.Embed(
-            description="\n".join(lines),
-            colour=discord.Colour.green() if full else discord.Colour.blurple(),
-        )
-        embed.set_footer(text=f"{len(member_ids)}/{party_size} players")
-        return embed
-
-    async def _lobby_payload(
+    async def _lobby_view(
         self,
         game: aiosqlite.Row,
-        member_ids: list[int]
-    ) -> tuple[discord.Embed, discord.File | None]:
-        embed = self._build_embed(game, member_ids)
+        member_ids: list[int],
+    ) -> tuple[LobbyLayout, discord.File | None]:
         strip = await self._avatar_strip(member_ids)
-        if strip is not None:
-            embed.set_image(url=f"attachment://{STRIP_FILENAME}")
-        return embed, strip
+        view = LobbyLayout(self, game, member_ids, has_strip=strip is not None)
+        return view, strip
 
     async def render(self, lobby: aiosqlite.Row, *, bump: bool) -> None:
         """Redraw a lobby message; on member changes, keep it at the bottom.
@@ -419,32 +469,35 @@ class Lobby(commands.Cog):
         if channel is None:
             return
         members = await db.list_lobby_members(self.bot.db, lobby["id"])
-        embed, strip = await self._lobby_payload(lobby, members)
-        view = await self._member_view(members)
+        view, strip = await self._lobby_view(lobby, members)
 
-        send_kwargs = {"files": [strip]} if strip else {}
-        if bump and channel.last_message_id != lobby["message_id"]:
+        replace = bump and channel.last_message_id != lobby["message_id"]
+        if not replace:
             try:
-                message = await channel.send(embed=embed, view=view, **send_kwargs)
-            except discord.HTTPException:
+                await channel.get_partial_message(lobby["message_id"]).edit(
+                    view=view,
+                    attachments=[strip] if strip else [],
+                )
                 return
-            # Repoint the DB before deleting, so the raw-delete listener
-            # doesn't mistake our own bump for the lobby being removed.
-            await db.move_lobby(self.bot.db, lobby["id"], channel.id, message.id)
-            try:
-                await channel.get_partial_message(lobby["message_id"]).delete()
+            except discord.NotFound:
+                await db.delete_lobby(self.bot.db, lobby["id"])
+                return
             except discord.HTTPException:
-                pass
-            return
+                # e.g. a lobby message from before the layout rework can't
+                # be edited into the new format - replace it instead.
+                view, strip = await self._lobby_view(lobby, members)
 
         try:
-            await channel.get_partial_message(lobby["message_id"]).edit(
-                embed=embed,
-                view = view,
-                attachments=[strip] if strip else []
+            message = await channel.send(
+                view=view, **({"files": [strip]} if strip else {})
             )
-        except discord.NotFound:
-            await db.delete_lobby(self.bot.db, lobby["id"])
+        except discord.HTTPException:
+            return
+        # Repoint the DB before deleting, so the raw-delete listener
+        # doesn't mistake our own bump for the lobby being removed.
+        await db.move_lobby(self.bot.db, lobby["id"], channel.id, message.id)
+        try:
+            await channel.get_partial_message(lobby["message_id"]).delete()
         except discord.HTTPException:
             pass
 
@@ -482,12 +535,9 @@ class Lobby(commands.Cog):
                 self.bot.db, lobby["id"], interaction.user.id, interaction.user.id
             )
             members = await db.list_lobby_members(self.bot.db, lobby["id"])
-            embed, strip = await self._lobby_payload(lobby, members)
-            send_kwargs = {"files": [strip]} if strip else {}
+            view, strip = await self._lobby_view(lobby, members)
             await interaction.response.send_message(
-                embed=embed,
-                view=await self._member_view(members),
-                **send_kwargs,
+                view=view, **({"files": [strip]} if strip else {})
             )
             message = await interaction.original_response()
             old_channel_id, old_message_id = lobby["channel_id"], lobby["message_id"]
@@ -500,12 +550,9 @@ class Lobby(commands.Cog):
                     pass
         else:
             members = [interaction.user.id]
-            embed, strip = await self._lobby_payload(game_row, members)
-            send_kwargs = {"files": [strip]} if strip else {}
+            view, strip = await self._lobby_view(game_row, members)
             await interaction.response.send_message(
-                embed=embed,
-                view=await self._member_view(members),
-                **send_kwargs
+                view=view, **({"files": [strip]} if strip else {})
             )
             message = await interaction.original_response()
             lobby_id = await db.create_lobby(
@@ -568,14 +615,16 @@ class Lobby(commands.Cog):
         await db.delete_lobby(self.bot.db, lobby["id"])
         channel = await self._get_channel(lobby["channel_id"])
         if channel is not None:
-            closed = discord.Embed(
-                description=f"## {_game_label(lobby)} lobby\n*Closed.*",
-                colour=discord.Colour.dark_grey(),
+            closed = discord.ui.LayoutView(timeout=None)
+            closed.add_item(
+                discord.ui.Container(
+                    discord.ui.TextDisplay(f"## {_game_label(lobby)} lobby\n*Closed.*"),
+                    accent_colour=discord.Colour.dark_grey(),
+                )
             )
             try:
                 await channel.get_partial_message(lobby["message_id"]).edit(
-                    embed=closed,
-                    view=None,
+                    view=closed,
                     attachments=[],
                 )
             except discord.HTTPException:
