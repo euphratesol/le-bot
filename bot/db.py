@@ -290,6 +290,11 @@ async def move_lobby(
     await db.commit()
 
 
+async def get_lobby(db: aiosqlite.Connection, lobby_id: int) -> aiosqlite.Row | None:
+    async with db.execute(_LOBBY_WITH_GAME + "WHERE l.id = ?", (lobby_id,)) as cursor:
+        return await cursor.fetchone()
+
+
 async def get_lobby_by_message(
     db: aiosqlite.Connection,
     message_id: int,
