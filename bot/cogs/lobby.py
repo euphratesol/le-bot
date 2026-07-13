@@ -7,7 +7,6 @@ from io import BytesIO
 import aiosqlite
 import discord
 from discord import app_commands
-from discord.app_commands import allowed_contexts
 from discord.ext import commands
 from PIL import Image, ImageDraw
 
@@ -18,7 +17,7 @@ log = logging.getLogger(__name__)
 
 PING_COOLDOWN = timedelta(seconds=30)
 MAX_PING_MENTIONS = 50
-AVATAR_SIZE = 64
+AVATAR_SIZE = 48
 AVATAR_PAD = 8
 MAX_AVATARS = 10
 AVATAR_CACHE_LIMIT = 100
@@ -135,9 +134,8 @@ class AddPlayerSelect(
         # Leave the pick visible in the dropdown as feedback; Add commits it.
         await interaction.response.defer()
 
-
-class AddConfirmRow(discord.ui.ActionRow):
-    """The Add button that commits the staged dropdown pick."""
+class LobbyControls(discord.ui.ActionRow):
+    """The Add/Join/Leave/Ping/Clear buttons on every lobby message."""
 
     def __init__(self, cog: "Lobby"):
         super().__init__()
@@ -179,14 +177,6 @@ class AddConfirmRow(discord.ui.ActionRow):
             )
             return
         await self.cog.after_member_change(lobby)
-
-
-class LobbyControls(discord.ui.ActionRow):
-    """The Join/Leave/Ping/Clear buttons on every lobby message."""
-
-    def __init__(self, cog: "Lobby"):
-        super().__init__()
-        self.cog = cog
 
     @discord.ui.button(
         label="Join", style=discord.ButtonStyle.success, custom_id="lobby:join"
@@ -314,7 +304,7 @@ class LobbyLayout(discord.ui.LayoutView):
     # fixed parts (container, heading, footer, gallery, three action rows,
     # select, Add button, four control buttons) cost 13; a member row with
     # an inline x costs 3 (section + text + button), a plain text row 1.
-    ROW_BUDGET = 27
+    ROW_BUDGET = 28
 
     def __init__(
         self,
@@ -327,7 +317,6 @@ class LobbyLayout(discord.ui.LayoutView):
         if game is not None:
             self.add_item(self._container(cog, game, member_ids or [], has_strip))
             self.add_item(discord.ui.ActionRow(AddPlayerSelect()))
-        self.add_item(AddConfirmRow(cog))
         self.add_item(LobbyControls(cog))
 
     @staticmethod
