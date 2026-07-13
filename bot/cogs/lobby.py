@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -102,38 +103,81 @@ class KickButton(
         await cog.after_member_change(lobby)
 
 
-class AddPlayerRow(discord.ui.ActionRow):
-    """The 'Add a player...' user picker on every lobby message."""
+class AddPlayerSelect(
+    discord.ui.DynamicItem[discord.ui.UserSelect],
+    template=r"lobby:add_select:[0-9]+",
+):
+    def __init__(self):
+        super().__init__(
+            discord.ui.UserSelect(
+                placeholder="Add a player...",
+                custom_id=f"lobby:add_select:{time.time_ns()}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.UserSelect,
+        match: "re.Match[str]",
+    ) -> "AddPlayerSelect":
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog: "Lobby | None" = interaction.client.get_cog("Lobby")
+        if cog is None:
+            return
+        lobby = await cog.lobby_for(interaction)
+        if lobby is None:
+            return
+        cog.stage_add(lobby["id"], interaction.user.id, self.item.values[0].id)
+        # Leave the pick visible in the dropdown as feedback; Add commits it.
+        await interaction.response.defer()
+
+
+class AddConfirmRow(discord.ui.ActionRow):
+    """The Add button that commits the staged dropdown pick."""
 
     def __init__(self, cog: "Lobby"):
         super().__init__()
         self.cog = cog
 
-    @discord.ui.select(
-        cls=discord.ui.UserSelect,
-        placeholder="Add a player...",
-        custom_id="lobby:add_select",
+    @discord.ui.button(
+        label="Add", style=discord.ButtonStyle.primary, custom_id="lobby:add_confirm"
     )
-    async def add_player(
-        self,
-        interaction: discord.Interaction,
-        select: discord.ui.UserSelect,
+    async def add(
+        self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         lobby = await self.cog.lobby_for(interaction)
         if lobby is None:
             return
-        user = select.values[0]
-        added = await db.add_lobby_member(
-            self.cog.bot.db, lobby["id"], user.id, interaction.user.id
-        )
-        if not added:
+        staged = self.cog.take_staged_add(lobby["id"], interaction.user.id)
+        if staged is None:
             await interaction.response.send_message(
-                f"{user.mention} is already in the lobby.",
+                "Pick someone in the dropdown first.", ephemeral=True
+            )
+            return
+        added = await db.add_lobby_member(
+            self.cog.bot.db, lobby["id"], staged, interaction.user.id
+        )
+        # Respond by editing the message with a rebuilt view - the fresh
+        # picker nonce is what actually clears the dropdown.
+        members = await db.list_lobby_members(self.cog.bot.db, lobby["id"])
+        view, strip = await self.cog._lobby_view(lobby, members)
+        try:
+            await interaction.response.edit_message(
+                view=view, attachments=[strip] if strip else []
+            )
+        except discord.HTTPException:
+            pass
+        if not added:
+            await interaction.followup.send(
+                f"<@{staged}> is already in the lobby.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
-        await interaction.response.defer()
         await self.cog.after_member_change(lobby)
 
 
@@ -267,10 +311,10 @@ class LobbyLayout(discord.ui.LayoutView):
     """
 
     # Discord caps a message at 40 components, nested ones included. The
-    # fixed parts (container, heading, footer, gallery, two action rows,
-    # select, four buttons) cost 11; a member row with an inline x costs 3
-    # (section + text + button) while a plain text row costs 1.
-    ROW_BUDGET = 29
+    # fixed parts (container, heading, footer, gallery, three action rows,
+    # select, Add button, four control buttons) cost 13; a member row with
+    # an inline x costs 3 (section + text + button), a plain text row 1.
+    ROW_BUDGET = 27
 
     def __init__(
         self,
@@ -282,7 +326,8 @@ class LobbyLayout(discord.ui.LayoutView):
         super().__init__(timeout=None)
         if game is not None:
             self.add_item(self._container(cog, game, member_ids or [], has_strip))
-        self.add_item(AddPlayerRow(cog))
+            self.add_item(discord.ui.ActionRow(AddPlayerSelect()))
+        self.add_item(AddConfirmRow(cog))
         self.add_item(LobbyControls(cog))
 
     @staticmethod
@@ -354,12 +399,23 @@ class Lobby(commands.Cog):
         self.bot = bot
         self.view = LobbyLayout(self)
         self._avatar_cache: dict[str, bytes] = {}
+        # (lobby_id, picker's user_id) -> user_id staged in the dropdown.
+        self._staged_adds: dict[tuple[int, int], int] = {}
 
     async def cog_load(self) -> None:
         # One persistent template handles the static components on every
-        # lobby message; DynamicItem registration covers the x buttons.
+        # lobby message; DynamicItem registration covers the x buttons and
+        # the nonce'd add dropdown.
         self.bot.add_view(self.view)
-        self.bot.add_dynamic_items(KickButton)
+        self.bot.add_dynamic_items(KickButton, AddPlayerSelect)
+
+    def stage_add(self, lobby_id: int, picker_id: int, user_id: int) -> None:
+        if len(self._staged_adds) > 500:
+            self._staged_adds.pop(next(iter(self._staged_adds)))
+        self._staged_adds[(lobby_id, picker_id)] = user_id
+
+    def take_staged_add(self, lobby_id: int, picker_id: int) -> int | None:
+        return self._staged_adds.pop((lobby_id, picker_id), None)
 
     async def game_autocomplete(
         self, interaction: discord.Interaction, current: str
@@ -531,9 +587,6 @@ class Lobby(commands.Cog):
         lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
         if lobby is not None:
             # Move the existing lobby here, members intact.
-            await db.add_lobby_member(
-                self.bot.db, lobby["id"], interaction.user.id, interaction.user.id
-            )
             members = await db.list_lobby_members(self.bot.db, lobby["id"])
             view, strip = await self._lobby_view(lobby, members)
             await interaction.response.send_message(
@@ -549,22 +602,18 @@ class Lobby(commands.Cog):
                 except discord.HTTPException:
                     pass
         else:
-            members = [interaction.user.id]
-            view, strip = await self._lobby_view(game_row, members)
+            view, strip = await self._lobby_view(game_row, [])
             await interaction.response.send_message(
                 view=view, **({"files": [strip]} if strip else {})
             )
             message = await interaction.original_response()
-            lobby_id = await db.create_lobby(
+            await db.create_lobby(
                 self.bot.db,
                 game_row["id"],
                 interaction.guild_id,
                 message.channel.id,
                 message.id,
                 interaction.user.id,
-            )
-            await db.add_lobby_member(
-                self.bot.db, lobby_id, interaction.user.id, interaction.user.id
             )
         await db.log_event(
             self.bot.db, interaction.guild_id, interaction.user.id,
