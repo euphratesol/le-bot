@@ -98,7 +98,20 @@ class KickButton(
                 allowed_mentions=discord.AllowedMentions.none()
             )
             return
-        await interaction.response.defer()
+        if self.user_id == interaction.user.id:
+            notice = f"{interaction.user.mention} left the {_game_label(lobby)} lobby."
+        else:
+            notice = (
+                f"{interaction.user.mention} removed <@{self.user_id}> from the "
+                f"{_game_label(lobby)} lobby."
+            )
+        await interaction.response.send_message(
+            notice, allowed_mentions=discord.AllowedMentions.none()
+        )
+        await db.log_event(
+            cog.bot.db, lobby["guild_id"], interaction.user.id,
+            "lobby_member_remove", f"{lobby['name']}:{self.user_id}",
+        )
         await cog.after_member_change(lobby)
 
 
@@ -176,6 +189,15 @@ class LobbyControls(discord.ui.ActionRow):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
+        await interaction.followup.send(
+            f"{interaction.user.mention} added <@{staged}> to the "
+            f"{_game_label(lobby)} lobby.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await db.log_event(
+            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
+            "lobby_member_add", f"{lobby['name']}:{staged}",
+        )
         await self.cog.after_member_change(lobby)
 
     @discord.ui.button(
@@ -195,7 +217,14 @@ class LobbyControls(discord.ui.ActionRow):
                 "You're already in this lobby.", ephemeral=True
             )
             return
-        await interaction.response.defer()
+        await interaction.response.send_message(
+            f"{interaction.user.mention} joined the {_game_label(lobby)} lobby.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await db.log_event(
+            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
+            "lobby_member_add", f"{lobby['name']}:{interaction.user.id}",
+        )
         await self.cog.after_member_change(lobby)
 
     @discord.ui.button(
@@ -215,7 +244,14 @@ class LobbyControls(discord.ui.ActionRow):
                 "You're not in this lobby.", ephemeral=True
             )
             return
-        await interaction.response.defer()
+        await interaction.response.send_message(
+            f"{interaction.user.mention} left the {_game_label(lobby)} lobby.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await db.log_event(
+            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
+            "lobby_member_remove", f"{lobby['name']}:{interaction.user.id}",
+        )
         await self.cog.after_member_change(lobby)
 
     @discord.ui.button(
@@ -635,6 +671,10 @@ class Lobby(commands.Cog):
             f"{interaction.user.mention} removed {user.mention} from the "
             f"{_game_label(lobby)} lobby.",
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await db.log_event(
+            self.bot.db, lobby["guild_id"], interaction.user.id,
+            "lobby_member_remove", f"{lobby['name']}:{user.id}",
         )
         await self.render(lobby, bump=True)
 
