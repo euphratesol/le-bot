@@ -25,7 +25,6 @@ MAX_AVATARS = 10
 AVATAR_CACHE_LIMIT = 100
 STRIP_FILENAME = "lobby.png"
 MAX_KICK_BUTTONS = 15
-LOBBIES = {"valorant": "batsignal"}
 
 
 def _game_label(row: aiosqlite.Row) -> str:
@@ -970,18 +969,11 @@ class Lobby(commands.Cog):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
             return
-        emoji = discord.PartialEmoji.from_str(message.content.strip())
-        if not emoji.is_custom_emoji():
-            return
-        game_name = next(
-            (name for name, summon in LOBBIES.items() if summon == emoji.name), None
-        )
-        if game_name is None:
+        emoji = _parse_emoji(message.content)
+        if emoji is None:
             return
         games = await db.list_lobby_games(self.bot.db, message.guild.id)
-        game = next(
-            (g for g in games if g["name"].lower() == game_name.lower()), None
-        )
+        game = next((g for g in games if g["emoji"] == emoji), None)
         if game is None:
             return
         lobby = await db.get_lobby_for_game(self.bot.db, game["id"])
