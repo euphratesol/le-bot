@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import re
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -426,6 +428,12 @@ class Lobby(commands.Cog):
         self._avatar_cache: dict[str, bytes] = {}
         # (lobby_id, picker's user_id) -> user_id staged in the dropdown.
         self._staged_adds: dict[tuple[int, int], int] = {}
+        # Per-lobby render debounce: one render runs at a time and bursts
+        # coalesce into it, so concurrent joins/kicks can't both replace the
+        # lobby message and strand a duplicate.
+        self._render_locks: dict[int, asyncio.Lock] = {}
+        self._render_dirty: set[int] = set()
+        self._render_bump: dict[int, bool] = {}
 
     async def cog_load(self) -> None:
         # One persistent template handles the static components on every
@@ -474,14 +482,20 @@ class Lobby(commands.Cog):
             await interaction.response.send_message(
                 "This lobby is no longer active.", ephemeral=True
             )
-            # A layout message must keep at least one component, so swap in
-            # a dead-end text instead of stripping the view entirely.
-            stale = discord.ui.LayoutView(timeout=None)
-            stale.add_item(discord.ui.TextDisplay("*This lobby is no longer active.*"))
+            # Self-heal: a lobby-looking message that isn't in the DB is a
+            # stranded duplicate - delete it rather than leave a corpse.
             try:
-                await interaction.message.edit(view=stale)
+                await interaction.message.delete()
             except discord.HTTPException:
-                pass
+                # Can't delete (e.g. missing permission): at least defuse it.
+                stale = discord.ui.LayoutView(timeout=None)
+                stale.add_item(
+                    discord.ui.TextDisplay("*This lobby is no longer active.*")
+                )
+                try:
+                    await interaction.message.edit(view=stale)
+                except discord.HTTPException:
+                    pass
         return lobby
 
     async def _get_channel(self, channel_id: int) -> discord.abc.Messageable | None:
@@ -540,16 +554,39 @@ class Lobby(commands.Cog):
         view = LobbyLayout(self, game, member_ids, has_strip=strip is not None)
         return view, strip
 
-    async def render(self, lobby: aiosqlite.Row, *, bump: bool) -> None:
-        """Redraw a lobby message; on member changes, keep it at the bottom.
+    def _render_lock(self, lobby_id: int) -> asyncio.Lock:
+        return self._render_locks.setdefault(lobby_id, asyncio.Lock())
 
-        `lobby` may be stale on everything except id/game fields - channel
-        and message ids are what they were when the caller fetched the row.
+    async def render(self, lobby: aiosqlite.Row, *, bump: bool) -> None:
+        """Request a redraw of a lobby message, debounced per lobby.
+
+        Only one redraw runs at a time; requests that arrive while one is in
+        flight coalesce into a single follow-up pass. Without this, two
+        concurrent member changes could both replace the lobby message and
+        strand a dead duplicate.
         """
+        lobby_id = lobby["id"]
+        self._render_dirty.add(lobby_id)
+        self._render_bump[lobby_id] = self._render_bump.get(lobby_id, False) or bump
+        lock = self._render_lock(lobby_id)
+        if lock.locked():
+            return  # the in-flight render's loop will pick this up
+        async with lock:
+            while lobby_id in self._render_dirty:
+                self._render_dirty.discard(lobby_id)
+                bump_now = self._render_bump.pop(lobby_id, False)
+                await self._render_once(lobby_id, bump=bump_now)
+
+    async def _render_once(self, lobby_id: int, *, bump: bool) -> None:
+        # Re-fetch inside the lock: a previous pass (or /lobby open) may
+        # have moved the lobby to a new message since the caller's row.
+        lobby = await db.get_lobby(self.bot.db, lobby_id)
+        if lobby is None:
+            return
         channel = await self._get_channel(lobby["channel_id"])
         if channel is None:
             return
-        members = await db.list_lobby_members(self.bot.db, lobby["id"])
+        members = await db.list_lobby_members(self.bot.db, lobby_id)
         view, strip = await self._lobby_view(lobby, members)
 
         replace = bump and channel.last_message_id != lobby["message_id"]
@@ -561,7 +598,7 @@ class Lobby(commands.Cog):
                 )
                 return
             except discord.NotFound:
-                await db.delete_lobby(self.bot.db, lobby["id"])
+                await db.delete_lobby(self.bot.db, lobby_id)
                 return
             except discord.HTTPException:
                 # e.g. a lobby message from before the layout rework can't
@@ -576,7 +613,7 @@ class Lobby(commands.Cog):
             return
         # Repoint the DB before deleting, so the raw-delete listener
         # doesn't mistake our own bump for the lobby being removed.
-        await db.move_lobby(self.bot.db, lobby["id"], channel.id, message.id)
+        await db.move_lobby(self.bot.db, lobby_id, channel.id, message.id)
         try:
             await channel.get_partial_message(lobby["message_id"]).delete()
         except discord.HTTPException:
@@ -611,35 +648,56 @@ class Lobby(commands.Cog):
 
         lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
         if lobby is not None:
-            # Move the existing lobby here, members intact.
-            members = await db.list_lobby_members(self.bot.db, lobby["id"])
-            view, strip = await self._lobby_view(lobby, members)
-            await interaction.response.send_message(
-                view=view, **({"files": [strip]} if strip else {})
-            )
-            message = await interaction.original_response()
-            old_channel_id, old_message_id = lobby["channel_id"], lobby["message_id"]
-            await db.move_lobby(self.bot.db, lobby["id"], message.channel.id, message.id)
-            old_channel = await self._get_channel(old_channel_id)
-            if old_channel is not None:
-                try:
-                    await old_channel.get_partial_message(old_message_id).delete()
-                except discord.HTTPException:
-                    pass
+            # Move the existing lobby here, members intact. Hold the render
+            # lock so a concurrent member-change redraw can't also replace
+            # the message and strand a duplicate.
+            async with self._render_lock(lobby["id"]):
+                lobby = await db.get_lobby(self.bot.db, lobby["id"]) or lobby
+                members = await db.list_lobby_members(self.bot.db, lobby["id"])
+                view, strip = await self._lobby_view(lobby, members)
+                await interaction.response.send_message(
+                    view=view, **({"files": [strip]} if strip else {})
+                )
+                message = await interaction.original_response()
+                old_channel_id, old_message_id = (
+                    lobby["channel_id"], lobby["message_id"]
+                )
+                await db.move_lobby(
+                    self.bot.db, lobby["id"], message.channel.id, message.id
+                )
+                old_channel = await self._get_channel(old_channel_id)
+                if old_channel is not None:
+                    try:
+                        await old_channel.get_partial_message(old_message_id).delete()
+                    except discord.HTTPException:
+                        pass
         else:
             view, strip = await self._lobby_view(game_row, [])
             await interaction.response.send_message(
                 view=view, **({"files": [strip]} if strip else {})
             )
             message = await interaction.original_response()
-            await db.create_lobby(
-                self.bot.db,
-                game_row["id"],
-                interaction.guild_id,
-                message.channel.id,
-                message.id,
-                interaction.user.id,
-            )
+            try:
+                await db.create_lobby(
+                    self.bot.db,
+                    game_row["id"],
+                    interaction.guild_id,
+                    message.channel.id,
+                    message.id,
+                    interaction.user.id,
+                )
+            except sqlite3.IntegrityError:
+                # Someone opened this game's lobby at the same moment and
+                # won the unique-lobby race - drop our message and surface
+                # theirs instead of stranding a duplicate.
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+                existing = await db.get_lobby_for_game(self.bot.db, game_row["id"])
+                if existing is not None:
+                    await self.render(existing, bump=True)
+                return
         await db.log_event(
             self.bot.db, interaction.guild_id, interaction.user.id,
             "lobby_open", game_row["name"],
