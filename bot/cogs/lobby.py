@@ -1,8 +1,6 @@
 import asyncio
 import logging
-import re
 import sqlite3
-import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -24,7 +22,6 @@ AVATAR_PAD = 8
 MAX_AVATARS = 10
 AVATAR_CACHE_LIMIT = 100
 STRIP_FILENAME = "lobby.png"
-MAX_KICK_BUTTONS = 15
 
 
 def _game_label(row: aiosqlite.Row) -> str:
@@ -60,147 +57,12 @@ def _parse_emoji(raw: str) -> str | None:
     return None
 
 
-class KickButton(
-    discord.ui.DynamicItem[discord.ui.Button],
-    template=r"lobby:kick:(?P<user_id>[0-9]+)",
-):
-    def __init__(self, user_id: int, label: str = "x"):
-        super().__init__(
-            discord.ui.Button(
-                style=discord.ButtonStyle.secondary,
-                label=label,
-                custom_id=f"lobby:kick:{user_id}",
-            )
-        )
-        self.user_id = user_id
-
-    @classmethod
-    async def from_custom_id(
-        cls,
-        interaction: discord.Interaction,
-        item: discord.ui.Button,
-        match: "re.Match[str]",
-    ) -> "KickButton":
-        return cls(int(match["user_id"]))
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        cog: "Lobby | None" = interaction.client.get_cog("Lobby")
-        if cog is None:
-            return
-        lobby = await cog.lobby_for(interaction)
-        if lobby is None:
-            return
-        removed = await db.remove_lobby_member(
-            cog.bot.db, lobby["id"], self.user_id
-        )
-        if not removed:
-            await interaction.response.send_message(
-                f"<@{self.user_id}> isn't in this lobby anymore.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-            return
-        if self.user_id == interaction.user.id:
-            notice = f"{interaction.user.mention} left the {_game_label(lobby)} lobby."
-        else:
-            notice = (
-                f"{interaction.user.mention} removed <@{self.user_id}> from the "
-                f"{_game_label(lobby)} lobby."
-            )
-        await interaction.response.send_message(
-            notice, allowed_mentions=discord.AllowedMentions.none()
-        )
-        await db.log_event(
-            cog.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_member_remove", f"{lobby['name']}:{self.user_id}",
-        )
-        await cog.after_member_change(lobby)
-
-
-class AddPlayerSelect(
-    discord.ui.DynamicItem[discord.ui.UserSelect],
-    template=r"lobby:add_select:[0-9]+",
-):
-    def __init__(self):
-        super().__init__(
-            discord.ui.UserSelect(
-                placeholder="Add a player...",
-                custom_id=f"lobby:add_select:{time.time_ns()}",
-            )
-        )
-
-    @classmethod
-    async def from_custom_id(
-        cls,
-        interaction: discord.Interaction,
-        item: discord.ui.UserSelect,
-        match: "re.Match[str]",
-    ) -> "AddPlayerSelect":
-        return cls()
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        cog: "Lobby | None" = interaction.client.get_cog("Lobby")
-        if cog is None:
-            return
-        lobby = await cog.lobby_for(interaction)
-        if lobby is None:
-            return
-        cog.stage_add(lobby["id"], interaction.user.id, self.item.values[0].id)
-        # Leave the pick visible in the dropdown as feedback; Add commits it.
-        await interaction.response.defer()
-
 class LobbyControls(discord.ui.ActionRow):
-    """The Add/Join/Leave/Ping/Clear buttons on every lobby message."""
+    """The Join/Leave/Ping/Clear buttons on every lobby message."""
 
     def __init__(self, cog: "Lobby"):
         super().__init__()
         self.cog = cog
-
-    @discord.ui.button(
-        label="Add", style=discord.ButtonStyle.primary, custom_id="lobby:add_confirm"
-    )
-    async def add(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        lobby = await self.cog.lobby_for(interaction)
-        if lobby is None:
-            return
-        staged = self.cog.take_staged_add(lobby["id"], interaction.user.id)
-        if staged is None:
-            await interaction.response.send_message(
-                "Pick someone in the dropdown first.", ephemeral=True
-            )
-            return
-        added = await db.add_lobby_member(
-            self.cog.bot.db, lobby["id"], staged, interaction.user.id
-        )
-        # Respond by editing the message with a rebuilt view - the fresh
-        # picker nonce is what actually clears the dropdown.
-        members = await db.list_lobby_members(self.cog.bot.db, lobby["id"])
-        view, strip = await self.cog._lobby_view(lobby, members)
-        try:
-            await interaction.response.edit_message(
-                view=view, attachments=[strip] if strip else []
-            )
-        except discord.HTTPException:
-            pass
-        if not added:
-            await interaction.followup.send(
-                f"<@{staged}> is already in the lobby.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        await interaction.followup.send(
-            f"{interaction.user.mention} added <@{staged}> to the "
-            f"{_game_label(lobby)} lobby.",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        await db.log_event(
-            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_member_add", f"{lobby['name']}:{staged}",
-        )
-        await self.cog.after_member_change(lobby)
 
     @discord.ui.button(
         label="Join", style=discord.ButtonStyle.success, custom_id="lobby:join"
@@ -219,7 +81,10 @@ class LobbyControls(discord.ui.ActionRow):
                 "You're already in this lobby.", ephemeral=True
             )
             return
-        await interaction.response.send_message(
+        # Plain channel message, not an interaction reply: the lobby message
+        # this would reply to gets deleted on the next bump.
+        await interaction.response.defer()
+        await interaction.channel.send(
             f"{interaction.user.mention} joined the {_game_label(lobby)} lobby.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -246,7 +111,8 @@ class LobbyControls(discord.ui.ActionRow):
                 "You're not in this lobby.", ephemeral=True
             )
             return
-        await interaction.response.send_message(
+        await interaction.response.defer()
+        await interaction.channel.send(
             f"{interaction.user.mention} left the {_game_label(lobby)} lobby.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -294,13 +160,10 @@ class LobbyControls(discord.ui.ActionRow):
             )
             return
 
+        await interaction.response.defer()
         mentions = [f"<@{uid}>" for uid in targets]
-        first, rest = mentions[:MAX_PING_MENTIONS], mentions[MAX_PING_MENTIONS:]
-        await interaction.response.send_message(
-            f"{' '.join(first)}"
-        )
-        while rest:
-            chunk, rest = rest[:MAX_PING_MENTIONS], rest[MAX_PING_MENTIONS:]
+        while mentions:
+            chunk, mentions = mentions[:MAX_PING_MENTIONS], mentions[MAX_PING_MENTIONS:]
             await interaction.channel.send(" ".join(chunk))
         await db.touch_lobby_ping(self.cog.bot.db, lobby["id"])
         await db.log_event(
@@ -318,7 +181,8 @@ class LobbyControls(discord.ui.ActionRow):
         if lobby is None:
             return
         await db.clear_lobby_members(self.cog.bot.db, lobby["id"])
-        await interaction.response.send_message(
+        await interaction.response.defer()
+        await interaction.channel.send(
             f"{interaction.user.mention} cleared the {_game_label(lobby)} lobby.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -330,19 +194,17 @@ class LobbyControls(discord.ui.ActionRow):
 
 
 class LobbyLayout(discord.ui.LayoutView):
-    """The whole lobby message: member rows with inline x buttons, the
-    avatar strip, and the add/control rows.
+    """The whole lobby message: member rows, the avatar strip, and the
+    control row.
 
     Built fresh for each render. A bare LobbyLayout(cog) is registered as
-    the persistent template so the static custom_ids survive restarts
-    (KickButton dispatch is covered separately by add_dynamic_items).
+    the persistent template so the static custom_ids survive restarts.
     """
 
     # Discord caps a message at 40 components, nested ones included. The
-    # fixed parts (container, heading, footer, gallery, three action rows,
-    # select, Add button, four control buttons) cost 13; a member row with
-    # an inline x costs 3 (section + text + button), a plain text row 1.
-    ROW_BUDGET = 28
+    # fixed parts (container, heading, footer, gallery, control row, four
+    # control buttons) cost 9; a member text row costs 1.
+    ROW_BUDGET = 31
 
     def __init__(
         self,
@@ -353,38 +215,24 @@ class LobbyLayout(discord.ui.LayoutView):
     ):
         super().__init__(timeout=None)
         if game is not None:
-            self.add_item(self._container(cog, game, member_ids or [], has_strip))
-            self.add_item(discord.ui.ActionRow(AddPlayerSelect()))
+            self.add_item(self._container(game, member_ids or [], has_strip))
         self.add_item(LobbyControls(cog))
 
     @staticmethod
     def _container(
-        cog: "Lobby",
         game: aiosqlite.Row,
         members: list[int],
         has_strip: bool,
     ) -> discord.ui.Container:
         party_size = game["party_size"]
         slots = min(max(party_size, len(members)), LobbyLayout.ROW_BUDGET)
-        max_inline = min(
-            MAX_KICK_BUTTONS, max(0, (LobbyLayout.ROW_BUDGET - slots) // 2)
-        )
 
         rows: list[discord.ui.Item] = [
             discord.ui.TextDisplay(f"## {_game_label(game)} lobby")
         ]
         for slot in range(slots):
             if slot < len(members):
-                line = f"{slot + 1}. <@{members[slot]}>"
-                if slot < max_inline:
-                    rows.append(
-                        discord.ui.Section(
-                            discord.ui.TextDisplay(line),
-                            accessory=KickButton(members[slot]),
-                        )
-                    )
-                else:
-                    rows.append(discord.ui.TextDisplay(line))
+                rows.append(discord.ui.TextDisplay(f"{slot + 1}. <@{members[slot]}>"))
             else:
                 rows.append(discord.ui.TextDisplay(f"{slot + 1}."))
         if has_strip:
@@ -421,13 +269,16 @@ class Lobby(commands.Cog):
         description="Manage who gets pinged for a game's lobbies.",
         parent=game_group,
     )
+    gamelobby_group = app_commands.Group(
+        name="lobby",
+        description="Manage a game's lobby members.",
+        parent=game_group,
+    )
 
     def __init__(self, bot: LeBot):
         self.bot = bot
         self.view = LobbyLayout(self)
         self._avatar_cache: dict[str, bytes] = {}
-        # (lobby_id, picker's user_id) -> user_id staged in the dropdown.
-        self._staged_adds: dict[tuple[int, int], int] = {}
         # Per-lobby render debounce: one render runs at a time and bursts
         # coalesce into it, so concurrent joins/kicks can't both replace the
         # lobby message and strand a duplicate.
@@ -437,18 +288,8 @@ class Lobby(commands.Cog):
 
     async def cog_load(self) -> None:
         # One persistent template handles the static components on every
-        # lobby message; DynamicItem registration covers the x buttons and
-        # the nonce'd add dropdown.
+        # lobby message.
         self.bot.add_view(self.view)
-        self.bot.add_dynamic_items(KickButton, AddPlayerSelect)
-
-    def stage_add(self, lobby_id: int, picker_id: int, user_id: int) -> None:
-        if len(self._staged_adds) > 500:
-            self._staged_adds.pop(next(iter(self._staged_adds)))
-        self._staged_adds[(lobby_id, picker_id)] = user_id
-
-    def take_staged_add(self, lobby_id: int, picker_id: int) -> int | None:
-        return self._staged_adds.pop((lobby_id, picker_id), None)
 
     async def game_autocomplete(
         self, interaction: discord.Interaction, current: str
@@ -703,7 +544,46 @@ class Lobby(commands.Cog):
             "lobby_open", game_row["name"],
         )
 
-    @lobby_group.command(name="remove", description="Remove someone from a game's lobby.")
+    @gamelobby_group.command(
+        name="add", description="Add someone to a game's lobby."
+    )
+    @app_commands.autocomplete(game=game_autocomplete)
+    async def lobby_add(
+        self, interaction: discord.Interaction, user: discord.Member, game: str
+    ) -> None:
+        game_row = await self._resolve_game(interaction, game)
+        if game_row is None:
+            return
+        lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
+        if lobby is None:
+            await interaction.response.send_message(
+                f"There's no open {_game_label(game_row)} lobby.", ephemeral=True
+            )
+            return
+        added = await db.add_lobby_member(
+            self.bot.db, lobby["id"], user.id, interaction.user.id
+        )
+        if not added:
+            await interaction.response.send_message(
+                f"{user.mention} is already in the {_game_label(lobby)} lobby.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await interaction.response.send_message(
+            f"{interaction.user.mention} added {user.mention} to the "
+            f"{_game_label(lobby)} lobby.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await db.log_event(
+            self.bot.db, lobby["guild_id"], interaction.user.id,
+            "lobby_member_add", f"{lobby['name']}:{user.id}",
+        )
+        await self.after_member_change(lobby)
+
+    @gamelobby_group.command(
+        name="remove", description="Remove someone from a game's lobby."
+    )
     @app_commands.autocomplete(game=game_autocomplete)
     async def lobby_remove(
         self, interaction: discord.Interaction, user: discord.Member, game: str
