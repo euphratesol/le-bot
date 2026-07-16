@@ -475,7 +475,9 @@ class Lobby(commands.Cog):
 
         try:
             message = await channel.send(
-                view=view, **({"files": [strip]} if strip else {})
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+                **({"files": [strip]} if strip else {}),
             )
         except discord.HTTPException:
             return
@@ -525,7 +527,9 @@ class Lobby(commands.Cog):
                 history = await db.list_lobby_history(self.bot.db, lobby["id"])
                 view, strip = await self._lobby_view(lobby, members, history)
                 await interaction.response.send_message(
-                    view=view, **({"files": [strip]} if strip else {})
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    **({"files": [strip]} if strip else {}),
                 )
                 message = await interaction.original_response()
                 old_channel_id, old_message_id = (
@@ -543,7 +547,9 @@ class Lobby(commands.Cog):
         else:
             view, strip = await self._lobby_view(game_row, [])
             await interaction.response.send_message(
-                view=view, **({"files": [strip]} if strip else {})
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+                **({"files": [strip]} if strip else {}),
             )
             message = await interaction.original_response()
             try:
@@ -860,7 +866,9 @@ class Lobby(commands.Cog):
         view, strip = await self._lobby_view(game, [])
         try:
             posted = await channel.send(
-                view=view, **({"files": [strip]} if strip else {})
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+                **({"files": [strip]} if strip else {}),
             )
         except discord.HTTPException:
             return None
