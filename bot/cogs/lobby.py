@@ -81,12 +81,9 @@ class LobbyControls(discord.ui.ActionRow):
                 "You're already in this lobby.", ephemeral=True
             )
             return
-        # Plain channel message, not an interaction reply: the lobby message
-        # this would reply to gets deleted on the next bump.
         await interaction.response.defer()
-        await interaction.channel.send(
-            f"{interaction.user.mention} joined the {_game_label(lobby)} lobby.",
-            allowed_mentions=discord.AllowedMentions.none(),
+        await db.add_lobby_history(
+            self.cog.bot.db, lobby["id"], interaction.user.id, "join"
         )
         await db.log_event(
             self.cog.bot.db, lobby["guild_id"], interaction.user.id,
@@ -112,9 +109,8 @@ class LobbyControls(discord.ui.ActionRow):
             )
             return
         await interaction.response.defer()
-        await interaction.channel.send(
-            f"{interaction.user.mention} left the {_game_label(lobby)} lobby.",
-            allowed_mentions=discord.AllowedMentions.none(),
+        await db.add_lobby_history(
+            self.cog.bot.db, lobby["id"], interaction.user.id, "leave"
         )
         await db.log_event(
             self.cog.bot.db, lobby["guild_id"], interaction.user.id,
@@ -181,11 +177,10 @@ class LobbyControls(discord.ui.ActionRow):
         if lobby is None:
             return
         await db.clear_lobby_members(self.cog.bot.db, lobby["id"])
-        await interaction.response.defer()
-        await interaction.channel.send(
-            f"{interaction.user.mention} cleared the {_game_label(lobby)} lobby.",
-            allowed_mentions=discord.AllowedMentions.none(),
+        await db.add_lobby_history(
+            self.cog.bot.db, lobby["id"], interaction.user.id, "clear"
         )
+        await interaction.response.defer()
         await self.cog.render(lobby, bump=True)
         await db.log_event(
             self.cog.bot.db, lobby["guild_id"], interaction.user.id,
@@ -194,17 +189,18 @@ class LobbyControls(discord.ui.ActionRow):
 
 
 class LobbyLayout(discord.ui.LayoutView):
-    """The whole lobby message: member rows, the avatar strip, and the
-    control row.
+    """The whole lobby message: member rows, the avatar strip, the history
+    card, and the control row.
 
     Built fresh for each render. A bare LobbyLayout(cog) is registered as
     the persistent template so the static custom_ids survive restarts.
     """
 
     # Discord caps a message at 40 components, nested ones included. The
-    # fixed parts (container, heading, footer, gallery, control row, four
-    # control buttons) cost 9; a member text row costs 1.
-    ROW_BUDGET = 31
+    # fixed parts (container, heading, footer, gallery, history card and
+    # its text, control row, four control buttons) cost 11; a member text
+    # row costs 1.
+    ROW_BUDGET = 29
 
     def __init__(
         self,
@@ -212,11 +208,38 @@ class LobbyLayout(discord.ui.LayoutView):
         game: aiosqlite.Row | None = None,
         member_ids: list[int] | None = None,
         has_strip: bool = False,
+        history: list[aiosqlite.Row] | None = None,
     ):
         super().__init__(timeout=None)
         if game is not None:
             self.add_item(self._container(game, member_ids or [], has_strip))
+            if history:
+                self.add_item(self._history_card(history))
         self.add_item(LobbyControls(cog))
+
+    @staticmethod
+    def _history_card(history: list[aiosqlite.Row]) -> discord.ui.Container:
+        lines = ["### History"]
+        for entry in history:
+            actor, target = entry["actor_id"], entry["target_id"]
+            match entry["action"]:
+                case "join":
+                    what = f"<@{actor}> joined"
+                case "leave":
+                    what = f"<@{actor}> left"
+                case "add":
+                    what = f"<@{actor}> added <@{target}>"
+                case "remove":
+                    what = f"<@{actor}> removed <@{target}>"
+                case "clear":
+                    what = f"<@{actor}> cleared the lobby"
+                case action:
+                    what = f"<@{actor}> {action}"
+            lines.append(f"-# {what} · <t:{entry['ts']}:R>")
+        return discord.ui.Container(
+            discord.ui.TextDisplay("\n".join(lines)),
+            accent_colour=discord.Colour.dark_grey(),
+        )
 
     @staticmethod
     def _container(
@@ -390,9 +413,12 @@ class Lobby(commands.Cog):
         self,
         game: aiosqlite.Row,
         member_ids: list[int],
+        history: list[aiosqlite.Row] | None = None,
     ) -> tuple[LobbyLayout, discord.File | None]:
         strip = await self._avatar_strip(member_ids)
-        view = LobbyLayout(self, game, member_ids, has_strip=strip is not None)
+        view = LobbyLayout(
+            self, game, member_ids, has_strip=strip is not None, history=history
+        )
         return view, strip
 
     def _render_lock(self, lobby_id: int) -> asyncio.Lock:
@@ -428,7 +454,8 @@ class Lobby(commands.Cog):
         if channel is None:
             return
         members = await db.list_lobby_members(self.bot.db, lobby_id)
-        view, strip = await self._lobby_view(lobby, members)
+        history = await db.list_lobby_history(self.bot.db, lobby_id)
+        view, strip = await self._lobby_view(lobby, members, history)
 
         replace = bump and channel.last_message_id != lobby["message_id"]
         if not replace:
@@ -444,7 +471,7 @@ class Lobby(commands.Cog):
             except discord.HTTPException:
                 # e.g. a lobby message from before the layout rework can't
                 # be edited into the new format - replace it instead.
-                view, strip = await self._lobby_view(lobby, members)
+                view, strip = await self._lobby_view(lobby, members, history)
 
         try:
             message = await channel.send(
@@ -495,7 +522,8 @@ class Lobby(commands.Cog):
             async with self._render_lock(lobby["id"]):
                 lobby = await db.get_lobby(self.bot.db, lobby["id"]) or lobby
                 members = await db.list_lobby_members(self.bot.db, lobby["id"])
-                view, strip = await self._lobby_view(lobby, members)
+                history = await db.list_lobby_history(self.bot.db, lobby["id"])
+                view, strip = await self._lobby_view(lobby, members, history)
                 await interaction.response.send_message(
                     view=view, **({"files": [strip]} if strip else {})
                 )
@@ -571,9 +599,12 @@ class Lobby(commands.Cog):
             )
             return
         await interaction.response.send_message(
-            f"{interaction.user.mention} added {user.mention} to the "
-            f"{_game_label(lobby)} lobby.",
+            f"Added {user.mention} to the {_game_label(lobby)} lobby.",
+            ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await db.add_lobby_history(
+            self.bot.db, lobby["id"], interaction.user.id, "add", user.id
         )
         await db.log_event(
             self.bot.db, lobby["guild_id"], interaction.user.id,
@@ -606,9 +637,12 @@ class Lobby(commands.Cog):
             )
             return
         await interaction.response.send_message(
-            f"{interaction.user.mention} removed {user.mention} from the "
-            f"{_game_label(lobby)} lobby.",
+            f"Removed {user.mention} from the {_game_label(lobby)} lobby.",
+            ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await db.add_lobby_history(
+            self.bot.db, lobby["id"], interaction.user.id, "remove", user.id
         )
         await db.log_event(
             self.bot.db, lobby["guild_id"], interaction.user.id,
@@ -868,6 +902,9 @@ class Lobby(commands.Cog):
         )
         if not added:
             return
+        await db.add_lobby_history(
+            self.bot.db, lobby["id"], message.author.id, "join"
+        )
         await db.log_event(
             self.bot.db, lobby["guild_id"], message.author.id,
             "lobby_member_add", f"{lobby['name']}:{message.author.id}",

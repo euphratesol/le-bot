@@ -369,6 +369,34 @@ async def list_lobby_members(db: aiosqlite.Connection, lobby_id: int) -> list[in
         return [row[0] for row in await cursor.fetchall()]
 
 
+async def add_lobby_history(
+    db: aiosqlite.Connection,
+    lobby_id: int,
+    actor_id: int,
+    action: str,
+    target_id: int | None = None,
+) -> None:
+    await db.execute(
+        "INSERT INTO lobby_history (lobby_id, actor_id, target_id, action) "
+        "VALUES (?, ?, ?, ?)",
+        (lobby_id, actor_id, target_id, action),
+    )
+    await db.commit()
+
+
+async def list_lobby_history(
+    db: aiosqlite.Connection, lobby_id: int, limit: int = 5
+) -> list[aiosqlite.Row]:
+    """The most recent history entries for a lobby, newest first."""
+    async with db.execute(
+        "SELECT actor_id, target_id, action, "
+        "CAST(strftime('%s', created_at) AS INTEGER) AS ts "
+        "FROM lobby_history WHERE lobby_id = ? ORDER BY id DESC LIMIT ?",
+        (lobby_id, limit),
+    ) as cursor:
+        return list(await cursor.fetchall())
+
+
 async def mark_lobby_announced(db: aiosqlite.Connection, lobby_id: int) -> bool:
     cursor = await db.execute(
         "UPDATE lobbies SET announced = 1 WHERE id = ? AND announced = 0", (lobby_id,)
