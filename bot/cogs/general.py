@@ -19,6 +19,9 @@ class General(commands.Cog):
         count = await db.increment_counter(
             self.bot.db, interaction.guild_id or 0, interaction.user.id, "ping"
         )
+        await db.log_event(
+            self.bot.db, interaction.guild_id or 0, interaction.user.id, "ping"
+        )
         await interaction.response.send_message(
             f"Pong ({latency_ms}ms) - that's ping #{count} from you."
         )

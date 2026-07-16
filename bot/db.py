@@ -143,6 +143,38 @@ async def log_event(
     await db.commit()
 
 
+async def list_events(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int | None = None,
+    event_type: str | None = None,
+    limit: int = 20,
+) -> list[aiosqlite.Row]:
+    """The most recent interaction log entries for a guild, newest first."""
+    async with db.execute(
+        """
+        SELECT user_id, event_type, detail,
+               CAST(strftime('%s', created_at) AS INTEGER) AS ts
+        FROM events
+        WHERE guild_id = ?
+          AND (? IS NULL OR user_id = ?)
+          AND (? IS NULL OR event_type = ?)
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (guild_id, user_id, user_id, event_type, event_type, limit),
+    ) as cursor:
+        return list(await cursor.fetchall())
+
+
+async def list_event_types(db: aiosqlite.Connection, guild_id: int) -> list[str]:
+    async with db.execute(
+        "SELECT DISTINCT event_type FROM events WHERE guild_id = ? ORDER BY event_type",
+        (guild_id,),
+    ) as cursor:
+        return [row[0] for row in await cursor.fetchall()]
+
+
 async def add_lobby_game(
     db: aiosqlite.Connection,
     guild_id: int,

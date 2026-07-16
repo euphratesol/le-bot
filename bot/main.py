@@ -10,6 +10,7 @@ from bot.config import Config, load_config, load_phrases
 log = logging.getLogger(__name__)
 
 INITIAL_EXTENSIONS = [
+    "bot.cogs.auditlog",
     "bot.cogs.counting",
     "bot.cogs.general",
     "bot.cogs.lobby",

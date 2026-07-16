@@ -33,14 +33,22 @@ class Counting(commands.Cog):
                     _counter_name(phrase),
                 )
                 await message.channel.send(f"You have {count} {phrase}s.")
+                await db.log_event(
+                    self.bot.db, guild_id, message.author.id,
+                    "counter_check", phrase,
+                )
             return
 
         if phrase in self.bot.phrases.counted_phrases:
             await db.increment_counter(
                 self.bot.db,
-                message.guild.id if message.guild else 0,
+                guild_id,
                 message.author.id,
                 _counter_name(phrase),
+            )
+            await db.log_event(
+                self.bot.db, guild_id, message.author.id,
+                "counter_increment", phrase,
             )
 
 
