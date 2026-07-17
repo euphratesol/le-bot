@@ -23,7 +23,14 @@ class LeBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
 
-        super().__init__(command_prefix="n!", intents=intents, help_command=None)
+        super().__init__(
+            command_prefix="n!",
+            intents=intents,
+            help_command=None,
+            # Mentions never ping unless a send opts back in explicitly
+            # (lobby pings and the full-party announcement).
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.config = config
         self.db: aiosqlite.Connection | None = None
         self.phrases = load_phrases(config.phrases_path)

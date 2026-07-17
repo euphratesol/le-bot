@@ -282,7 +282,8 @@ async def get_ping_list(db: aiosqlite.Connection, game_id: int) -> list[int]:
 
 
 _LOBBY_WITH_GAME = """
-    SELECT l.*, g.name, g.party_size, g.emoji
+    SELECT l.*, g.name, g.party_size, g.emoji,
+           CAST(strftime('%s', l.last_ping_at) AS INTEGER) AS last_ping_ts
     FROM lobbies l
     JOIN lobby_games g ON g.id = l.game_id
 """

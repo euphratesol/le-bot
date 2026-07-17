@@ -1,276 +1,12 @@
-import asyncio
-import logging
-import sqlite3
-from datetime import datetime, timedelta, timezone
-from io import BytesIO
-
-import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
-from PIL import Image, ImageDraw
 
 from bot import db
+from bot.cogs.lobby.options import GameOption, on_game_command_error, parse_emoji
+from bot.cogs.lobby.service import LobbyService
+from bot.cogs.lobby.views import LobbyLayout, game_label
 from bot.main import LeBot
-
-log = logging.getLogger(__name__)
-
-PING_COOLDOWN = timedelta(seconds=30)
-MAX_PING_MENTIONS = 50
-AVATAR_SIZE = 48
-AVATAR_PAD = 8
-MAX_AVATARS = 10
-AVATAR_CACHE_LIMIT = 100
-STRIP_FILENAME = "lobby.png"
-
-
-def _game_label(row: aiosqlite.Row) -> str:
-    return f"{row['emoji']} {row['name']}" if row["emoji"] else row["name"]
-
-
-def _compose_avatar_strip(avatars: list[bytes]) -> bytes:
-    size, pad = AVATAR_SIZE, AVATAR_PAD
-    canvas = Image.new(
-        "RGBA",
-        (pad + len(avatars) * (size + pad), size + 2 * pad),
-        (0, 0, 0, 0),
-    )
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
-    for slot, blob in enumerate(avatars):
-        head = Image.open(BytesIO(blob)).convert("RGBA").resize((size, size))
-        canvas.paste(head, (pad + slot * (size + pad), pad), mask)
-    out = BytesIO()
-    canvas.save(out, format="PNG")
-    return out.getvalue()
-
-
-def _parse_emoji(raw: str) -> str | None:
-    emoji = discord.PartialEmoji.from_str(raw.strip())
-    if emoji.is_custom_emoji():
-        return str(emoji)
-    # Unicode emoji: from_str puts arbitrary text in .name, so filter out
-    # anything that reads as plain words rather than emoji characters.
-    name = emoji.name.strip()
-    if name and len(name) <= 8 and not any(ch.isalnum() and ch.isascii() for ch in name):
-        return name
-    return None
-
-
-class LobbyControls(discord.ui.ActionRow):
-    """The Join/Leave/Ping/Clear buttons on every lobby message."""
-
-    def __init__(self, cog: "Lobby"):
-        super().__init__()
-        self.cog = cog
-
-    @discord.ui.button(
-        label="Join", style=discord.ButtonStyle.success, custom_id="lobby:join"
-    )
-    async def join(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        lobby = await self.cog.lobby_for(interaction)
-        if lobby is None:
-            return
-        added = await db.add_lobby_member(
-            self.cog.bot.db, lobby["id"], interaction.user.id, interaction.user.id
-        )
-        if not added:
-            await interaction.response.send_message(
-                "You're already in this lobby.", ephemeral=True
-            )
-            return
-        await interaction.response.defer()
-        await db.add_lobby_history(
-            self.cog.bot.db, lobby["id"], interaction.user.id, "join"
-        )
-        await db.log_event(
-            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_member_add", f"{lobby['name']}:{interaction.user.id}",
-        )
-        await self.cog.after_member_change(lobby)
-
-    @discord.ui.button(
-        label="Leave", style=discord.ButtonStyle.secondary, custom_id="lobby:leave"
-    )
-    async def leave(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        lobby = await self.cog.lobby_for(interaction)
-        if lobby is None:
-            return
-        removed = await db.remove_lobby_member(
-            self.cog.bot.db, lobby["id"], interaction.user.id
-        )
-        if not removed:
-            await interaction.response.send_message(
-                "You're not in this lobby.", ephemeral=True
-            )
-            return
-        await interaction.response.defer()
-        await db.add_lobby_history(
-            self.cog.bot.db, lobby["id"], interaction.user.id, "leave"
-        )
-        await db.log_event(
-            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_member_remove", f"{lobby['name']}:{interaction.user.id}",
-        )
-        await self.cog.after_member_change(lobby)
-
-    @discord.ui.button(
-        label="Ping",
-        style=discord.ButtonStyle.primary,
-        custom_id="lobby:ping",
-    )
-    async def ping(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        lobby = await self.cog.lobby_for(interaction)
-        if lobby is None:
-            return
-
-        if lobby["last_ping_at"]:
-            last = datetime.strptime(
-                lobby["last_ping_at"], "%Y-%m-%d %H:%M:%S"
-            ).replace(tzinfo=timezone.utc)
-            remaining = PING_COOLDOWN - (datetime.now(timezone.utc) - last)
-            if remaining > timedelta(0):
-                await interaction.response.send_message(
-                    f"Ping cooldown, try again in {max(1, int(remaining.total_seconds()))}s.",
-                    ephemeral=True,
-                )
-                return
-
-        members = await db.list_lobby_members(self.cog.bot.db, lobby["id"])
-        targets = [
-            uid
-            for uid in await db.get_ping_list(self.cog.bot.db, lobby["game_id"])
-            if uid not in members
-        ]
-        if not targets:
-            await interaction.response.send_message(
-                f"No one to ping for {_game_label(lobby)} - an admin can add "
-                "people with `/game pinglist add`.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer()
-        mentions = [f"<@{uid}>" for uid in targets]
-        while mentions:
-            chunk, mentions = mentions[:MAX_PING_MENTIONS], mentions[MAX_PING_MENTIONS:]
-            await interaction.channel.send(" ".join(chunk))
-        await db.touch_lobby_ping(self.cog.bot.db, lobby["id"])
-        await db.log_event(
-            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_ping", lobby["name"],
-        )
-
-    @discord.ui.button(
-        label="Clear", style=discord.ButtonStyle.danger, custom_id="lobby:clear"
-    )
-    async def clear(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        lobby = await self.cog.lobby_for(interaction)
-        if lobby is None:
-            return
-        await db.clear_lobby_members(self.cog.bot.db, lobby["id"])
-        await db.add_lobby_history(
-            self.cog.bot.db, lobby["id"], interaction.user.id, "clear"
-        )
-        await interaction.response.defer()
-        await self.cog.render(lobby, bump=True)
-        await db.log_event(
-            self.cog.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_clear", lobby["name"],
-        )
-
-
-class LobbyLayout(discord.ui.LayoutView):
-    """The whole lobby message: member rows, the avatar strip, the history
-    card, and the control row.
-
-    Built fresh for each render. A bare LobbyLayout(cog) is registered as
-    the persistent template so the static custom_ids survive restarts.
-    """
-
-    # Discord caps a message at 40 components, nested ones included. The
-    # fixed parts (container, heading, footer, gallery, history card and
-    # its text, control row, four control buttons) cost 11; a member text
-    # row costs 1.
-    ROW_BUDGET = 29
-
-    def __init__(
-        self,
-        cog: "Lobby",
-        game: aiosqlite.Row | None = None,
-        member_ids: list[int] | None = None,
-        has_strip: bool = False,
-        history: list[aiosqlite.Row] | None = None,
-    ):
-        super().__init__(timeout=None)
-        if game is not None:
-            self.add_item(self._container(game, member_ids or [], has_strip))
-            if history:
-                self.add_item(self._history_card(history))
-        self.add_item(LobbyControls(cog))
-
-    @staticmethod
-    def _history_card(history: list[aiosqlite.Row]) -> discord.ui.Container:
-        lines = ["### History"]
-        for entry in history:
-            actor, target = entry["actor_id"], entry["target_id"]
-            match entry["action"]:
-                case "join":
-                    what = f"<@{actor}> joined"
-                case "leave":
-                    what = f"<@{actor}> left"
-                case "add":
-                    what = f"<@{actor}> added <@{target}>"
-                case "remove":
-                    what = f"<@{actor}> removed <@{target}>"
-                case "clear":
-                    what = f"<@{actor}> cleared the lobby"
-                case action:
-                    what = f"<@{actor}> {action}"
-            lines.append(f"-# {what} · <t:{entry['ts']}:R>")
-        return discord.ui.Container(
-            discord.ui.TextDisplay("\n".join(lines)),
-            accent_colour=discord.Colour.dark_grey(),
-        )
-
-    @staticmethod
-    def _container(
-        game: aiosqlite.Row,
-        members: list[int],
-        has_strip: bool,
-    ) -> discord.ui.Container:
-        party_size = game["party_size"]
-        slots = min(max(party_size, len(members)), LobbyLayout.ROW_BUDGET)
-
-        rows: list[discord.ui.Item] = [
-            discord.ui.TextDisplay(f"## {_game_label(game)} lobby")
-        ]
-        for slot in range(slots):
-            if slot < len(members):
-                rows.append(discord.ui.TextDisplay(f"{slot + 1}. <@{members[slot]}>"))
-            else:
-                rows.append(discord.ui.TextDisplay(f"{slot + 1}."))
-        if has_strip:
-            rows.append(
-                discord.ui.MediaGallery(
-                    discord.MediaGalleryItem(f"attachment://{STRIP_FILENAME}")
-                )
-            )
-        rows.append(discord.ui.TextDisplay(f"-# {len(members)}/{party_size} players"))
-
-        full = len(members) >= party_size
-        return discord.ui.Container(
-            *rows,
-            accent_colour=discord.Colour.green() if full else discord.Colour.blurple(),
-        )
 
 
 class Lobby(commands.Cog):
@@ -281,572 +17,63 @@ class Lobby(commands.Cog):
         description="Organise a game lobby.",
         guild_only=True,
     )
-    game_group = app_commands.Group(
-        name="game",
-        description="Configure games available for lobbies.",
-        default_permissions=discord.Permissions(manage_guild=True),
-        guild_only=True,
-    )
-    pinglist_group = app_commands.Group(
-        name="pinglist",
-        description="Manage who gets pinged for a game's lobbies.",
-        parent=game_group,
-    )
-    gamelobby_group = app_commands.Group(
-        name="lobby",
-        description="Manage a game's lobby members.",
-        parent=game_group,
-    )
 
-    def __init__(self, bot: LeBot):
+    def __init__(self, bot: LeBot, service: LobbyService):
         self.bot = bot
-        self.view = LobbyLayout(self)
-        self._avatar_cache: dict[str, bytes] = {}
-        # Per-lobby render debounce: one render runs at a time and bursts
-        # coalesce into it, so concurrent joins/kicks can't both replace the
-        # lobby message and strand a duplicate.
-        self._render_locks: dict[int, asyncio.Lock] = {}
-        self._render_dirty: set[int] = set()
-        self._render_bump: dict[int, bool] = {}
+        self.service = service
+        self.view = LobbyLayout(service)
 
     async def cog_load(self) -> None:
         # One persistent template handles the static components on every
         # lobby message.
         self.bot.add_view(self.view)
 
-    async def game_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        games = await db.list_lobby_games(self.bot.db, interaction.guild_id)
-        current = current.lower()
-        return [
-            app_commands.Choice(name=game["name"], value=game["name"])
-            for game in games
-            if current in game["name"].lower()
-        ][:25]
-
-    async def _resolve_game(
-        self, interaction: discord.Interaction, name: str
-    ) -> aiosqlite.Row | None:
-        game = await db.get_lobby_game(self.bot.db, interaction.guild_id, name)
-        if game is None:
-            await interaction.response.send_message(
-                f"There's no game called **{name}** here - an admin can add it "
-                "with `/game add`.",
-                ephemeral=True,
-            )
-        return game
-
-    async def lobby_for(
-        self, interaction: discord.Interaction
-    ) -> aiosqlite.Row | None:
-        """The lobby a component interaction belongs to, or None (handled)."""
-        lobby = await db.get_lobby_by_message(self.bot.db, interaction.message.id)
-        if lobby is None:
-            await interaction.response.send_message(
-                "This lobby is no longer active.", ephemeral=True
-            )
-            # Self-heal: a lobby-looking message that isn't in the DB is a
-            # stranded duplicate - delete it rather than leave a corpse.
-            try:
-                await interaction.message.delete()
-            except discord.HTTPException:
-                # Can't delete (e.g. missing permission): at least defuse it.
-                stale = discord.ui.LayoutView(timeout=None)
-                stale.add_item(
-                    discord.ui.TextDisplay("*This lobby is no longer active.*")
-                )
-                try:
-                    await interaction.message.edit(view=stale)
-                except discord.HTTPException:
-                    pass
-        return lobby
-
-    async def _get_channel(self, channel_id: int) -> discord.abc.Messageable | None:
-        channel = self.bot.get_channel(channel_id)
-        if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(channel_id)
-            except discord.HTTPException:
-                return None
-        return channel
-
-    async def _resolve_user(self, user_id: int) -> discord.User | None:
-        user = self.bot.get_user(user_id)
-        if user is None:
-            try:
-                user = await self.bot.fetch_user(user_id)
-            except discord.HTTPException:
-                return None
-        return user
-
-    async def _avatar_bytes(self, user_id: int) -> bytes | None:
-        user = await self._resolve_user(user_id)
-        if user is None:
-            return None
-        asset = user.display_avatar.replace(size=128, format="png")
-        cached = self._avatar_cache.get(asset.url)
-        if cached is not None:
-            return cached
-        try:
-            data = await asset.read()
-        except discord.HTTPException:
-            return None
-        if len(self._avatar_cache) > AVATAR_CACHE_LIMIT:
-            self._avatar_cache.pop(next(iter(self._avatar_cache)))
-        self._avatar_cache[asset.url] = data
-        return data
-
-    async def _avatar_strip(self, member_ids: list[int]) -> discord.File | None:
-        avatars = []
-        for user_id in member_ids[:MAX_AVATARS]:
-            blob = await self._avatar_bytes(user_id)
-            if blob is not None:
-                avatars.append(blob)
-        if not avatars:
-            return None
-        return discord.File(
-            BytesIO(_compose_avatar_strip(avatars)), filename=STRIP_FILENAME
-        )
-
-    async def _lobby_view(
-        self,
-        game: aiosqlite.Row,
-        member_ids: list[int],
-        history: list[aiosqlite.Row] | None = None,
-    ) -> tuple[LobbyLayout, discord.File | None]:
-        strip = await self._avatar_strip(member_ids)
-        view = LobbyLayout(
-            self, game, member_ids, has_strip=strip is not None, history=history
-        )
-        return view, strip
-
-    def _render_lock(self, lobby_id: int) -> asyncio.Lock:
-        return self._render_locks.setdefault(lobby_id, asyncio.Lock())
-
-    async def render(self, lobby: aiosqlite.Row, *, bump: bool) -> None:
-        """Request a redraw of a lobby message, debounced per lobby.
-
-        Only one redraw runs at a time; requests that arrive while one is in
-        flight coalesce into a single follow-up pass. Without this, two
-        concurrent member changes could both replace the lobby message and
-        strand a dead duplicate.
-        """
-        lobby_id = lobby["id"]
-        self._render_dirty.add(lobby_id)
-        self._render_bump[lobby_id] = self._render_bump.get(lobby_id, False) or bump
-        lock = self._render_lock(lobby_id)
-        if lock.locked():
-            return  # the in-flight render's loop will pick this up
-        async with lock:
-            while lobby_id in self._render_dirty:
-                self._render_dirty.discard(lobby_id)
-                bump_now = self._render_bump.pop(lobby_id, False)
-                await self._render_once(lobby_id, bump=bump_now)
-
-    async def _render_once(self, lobby_id: int, *, bump: bool) -> None:
-        # Re-fetch inside the lock: a previous pass (or /lobby open) may
-        # have moved the lobby to a new message since the caller's row.
-        lobby = await db.get_lobby(self.bot.db, lobby_id)
-        if lobby is None:
-            return
-        channel = await self._get_channel(lobby["channel_id"])
-        if channel is None:
-            return
-        members = await db.list_lobby_members(self.bot.db, lobby_id)
-        history = await db.list_lobby_history(self.bot.db, lobby_id)
-        view, strip = await self._lobby_view(lobby, members, history)
-
-        replace = bump and channel.last_message_id != lobby["message_id"]
-        if not replace:
-            try:
-                await channel.get_partial_message(lobby["message_id"]).edit(
-                    view=view,
-                    attachments=[strip] if strip else [],
-                )
-                return
-            except discord.NotFound:
-                await db.delete_lobby(self.bot.db, lobby_id)
-                return
-            except discord.HTTPException:
-                # e.g. a lobby message from before the layout rework can't
-                # be edited into the new format - replace it instead.
-                view, strip = await self._lobby_view(lobby, members, history)
-
-        try:
-            message = await channel.send(
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-                **({"files": [strip]} if strip else {}),
-            )
-        except discord.HTTPException:
-            return
-        # Repoint the DB before deleting, so the raw-delete listener
-        # doesn't mistake our own bump for the lobby being removed.
-        await db.move_lobby(self.bot.db, lobby_id, channel.id, message.id)
-        try:
-            await channel.get_partial_message(lobby["message_id"]).delete()
-        except discord.HTTPException:
-            pass
-
-    async def after_member_change(self, lobby: aiosqlite.Row) -> None:
-        """Announce a filled party (once), then redraw/bump the lobby."""
-        members = await db.list_lobby_members(self.bot.db, lobby["id"])
-        if len(members) >= lobby["party_size"]:
-            if await db.mark_lobby_announced(self.bot.db, lobby["id"]):
-                channel = await self._get_channel(lobby["channel_id"])
-                if channel is not None:
-                    mentions = " ".join(f"<@{uid}>" for uid in members)
-                    try:
-                        await channel.send(
-                            f"The {_game_label(lobby)} lobby is full: {mentions}"
-                        )
-                    except discord.HTTPException:
-                        pass
-                await db.log_event(
-                    self.bot.db, lobby["guild_id"], lobby["created_by"],
-                    "lobby_full", lobby["name"],
-                )
-        await self.render(lobby, bump=True)
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        await on_game_command_error(interaction, error)
 
     @lobby_group.command(description="Open the lobby for a game (or bring it here).")
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def open(self, interaction: discord.Interaction, game: str) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-
-        lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
+    async def open(self, interaction: discord.Interaction, game: GameOption) -> None:
+        lobby = await db.get_lobby_for_game(self.bot.db, game["id"])
         if lobby is not None:
-            # Move the existing lobby here, members intact. Hold the render
-            # lock so a concurrent member-change redraw can't also replace
-            # the message and strand a duplicate.
-            async with self._render_lock(lobby["id"]):
-                lobby = await db.get_lobby(self.bot.db, lobby["id"]) or lobby
-                members = await db.list_lobby_members(self.bot.db, lobby["id"])
-                history = await db.list_lobby_history(self.bot.db, lobby["id"])
-                view, strip = await self._lobby_view(lobby, members, history)
+            # Move the existing lobby here, members intact.
+            async def send(
+                view: LobbyLayout, strip: discord.File | None
+            ) -> discord.Message:
                 await interaction.response.send_message(
-                    view=view,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                    **({"files": [strip]} if strip else {}),
+                    view=view, **({"files": [strip]} if strip else {})
                 )
-                message = await interaction.original_response()
-                old_channel_id, old_message_id = (
-                    lobby["channel_id"], lobby["message_id"]
-                )
-                await db.move_lobby(
-                    self.bot.db, lobby["id"], message.channel.id, message.id
-                )
-                old_channel = await self._get_channel(old_channel_id)
-                if old_channel is not None:
-                    try:
-                        await old_channel.get_partial_message(old_message_id).delete()
-                    except discord.HTTPException:
-                        pass
-        else:
-            view, strip = await self._lobby_view(game_row, [])
-            await interaction.response.send_message(
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-                **({"files": [strip]} if strip else {}),
-            )
-            message = await interaction.original_response()
-            try:
-                await db.create_lobby(
-                    self.bot.db,
-                    game_row["id"],
-                    interaction.guild_id,
-                    message.channel.id,
-                    message.id,
-                    interaction.user.id,
-                )
-            except sqlite3.IntegrityError:
-                # Someone opened this game's lobby at the same moment and
-                # won the unique-lobby race - drop our message and surface
-                # theirs instead of stranding a duplicate.
-                try:
-                    await message.delete()
-                except discord.HTTPException:
-                    pass
-                existing = await db.get_lobby_for_game(self.bot.db, game_row["id"])
-                if existing is not None:
-                    await self.render(existing, bump=True)
-                return
-        await db.log_event(
-            self.bot.db, interaction.guild_id, interaction.user.id,
-            "lobby_open", game_row["name"],
-        )
+                return await interaction.original_response()
 
-    @gamelobby_group.command(
-        name="add", description="Add someone to a game's lobby."
-    )
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def lobby_add(
-        self, interaction: discord.Interaction, user: discord.Member, game: str
-    ) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
-        if lobby is None:
-            await interaction.response.send_message(
-                f"There's no open {_game_label(game_row)} lobby.", ephemeral=True
+            await self.service.move_lobby_message(lobby, send)
+            await db.log_event(
+                self.bot.db, interaction.guild_id, interaction.user.id,
+                "lobby_move", game["name"],
             )
             return
-        added = await db.add_lobby_member(
-            self.bot.db, lobby["id"], user.id, interaction.user.id
-        )
-        if not added:
-            await interaction.response.send_message(
-                f"{user.mention} is already in the {_game_label(lobby)} lobby.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        await interaction.response.send_message(
-            f"Added {user.mention} to the {_game_label(lobby)} lobby.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        await db.add_lobby_history(
-            self.bot.db, lobby["id"], interaction.user.id, "add", user.id
-        )
-        await db.log_event(
-            self.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_member_add", f"{lobby['name']}:{user.id}",
-        )
-        await self.after_member_change(lobby)
 
-    @gamelobby_group.command(
-        name="remove", description="Remove someone from a game's lobby."
-    )
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def lobby_remove(
-        self, interaction: discord.Interaction, user: discord.Member, game: str
-    ) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
-        if lobby is None:
-            await interaction.response.send_message(
-                f"There's no open {_game_label(game_row)} lobby.", ephemeral=True
-            )
-            return
-        removed = await db.remove_lobby_member(self.bot.db, lobby["id"], user.id)
-        if not removed:
-            await interaction.response.send_message(
-                f"{user.mention} isn't in the {_game_label(lobby)} lobby.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
+        view, strip = await self.service.lobby_view(game, [])
         await interaction.response.send_message(
-            f"Removed {user.mention} from the {_game_label(lobby)} lobby.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
+            view=view, **({"files": [strip]} if strip else {})
         )
-        await db.add_lobby_history(
-            self.bot.db, lobby["id"], interaction.user.id, "remove", user.id
+        message = await interaction.original_response()
+        winner, created = await self.service.claim_lobby_message(
+            game, interaction.guild_id, message, interaction.user.id
         )
-        await db.log_event(
-            self.bot.db, lobby["guild_id"], interaction.user.id,
-            "lobby_member_remove", f"{lobby['name']}:{user.id}",
-        )
-        await self.render(lobby, bump=True)
+        if not created and winner is not None:
+            await self.service.render(winner, bump=True)
 
     @lobby_group.command(description="Close a game's lobby.")
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def close(self, interaction: discord.Interaction, game: str) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
-        if lobby is None:
-            await interaction.response.send_message(
-                f"There's no open {_game_label(game_row)} lobby.", ephemeral=True
-            )
-            return
-        await db.delete_lobby(self.bot.db, lobby["id"])
-        channel = await self._get_channel(lobby["channel_id"])
-        if channel is not None:
-            closed = discord.ui.LayoutView(timeout=None)
-            closed.add_item(
-                discord.ui.Container(
-                    discord.ui.TextDisplay(f"## {_game_label(lobby)} lobby\n*Closed.*"),
-                    accent_colour=discord.Colour.dark_grey(),
-                )
-            )
-            try:
-                await channel.get_partial_message(lobby["message_id"]).edit(
-                    view=closed,
-                    attachments=[],
-                )
-            except discord.HTTPException:
-                pass
+    async def close(self, interaction: discord.Interaction, game: GameOption) -> None:
+        lobby = await self.service.lobby_for_game(game)
+        await self.service.close_lobby(lobby)
         await interaction.response.send_message(
-            f"{interaction.user.mention} closed the {_game_label(lobby)} lobby.",
-            allowed_mentions=discord.AllowedMentions.none(),
+            f"{interaction.user.mention} closed the {game_label(lobby)} lobby."
         )
-
-    @game_group.command(description="Add a game that lobbies can be opened for.")
-    @app_commands.describe(
-        name="Name of the game.",
-        party_size="How many players make a full lobby.",
-        emoji="Optional emoji shown with the game.",
-    )
-    async def add(
-        self,
-        interaction: discord.Interaction,
-        name: str,
-        party_size: app_commands.Range[int, 2, 25],
-        emoji: str | None = None,
-    ) -> None:
-        parsed = None
-        if emoji is not None:
-            parsed = _parse_emoji(emoji)
-            if parsed is None:
-                await interaction.response.send_message(
-                    f"`{emoji}` doesn't look like an emoji.", ephemeral=True
-                )
-                return
-        name = name.strip()
-        game_id = await db.add_lobby_game(
-            self.bot.db, interaction.guild_id, name, party_size, parsed
-        )
-        if game_id is None:
-            await interaction.response.send_message(
-                f"**{name}** is already set up.", ephemeral=True
-            )
-            return
-        label = f"{parsed} {name}" if parsed else name
-        await interaction.response.send_message(
-            f"Added **{label}** (party of {party_size}). Open a lobby with "
-            f"`/lobby open`.",
-            ephemeral=True,
-        )
-
-    @game_group.command(description="Change a game's party size or emoji.")
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def edit(
-        self,
-        interaction: discord.Interaction,
-        game: str,
-        party_size: app_commands.Range[int, 2, 25] | None = None,
-        emoji: str | None = None,
-    ) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        parsed = None
-        if emoji is not None:
-            parsed = _parse_emoji(emoji)
-            if parsed is None:
-                await interaction.response.send_message(
-                    f"`{emoji}` doesn't look like an emoji.", ephemeral=True
-                )
-                return
-        if party_size is None and parsed is None:
-            await interaction.response.send_message(
-                "Nothing to change - pass a party size and/or an emoji.",
-                ephemeral=True,
-            )
-            return
-        await db.update_lobby_game(self.bot.db, game_row["id"], party_size, parsed)
-        await interaction.response.send_message(
-            f"Updated **{game_row['name']}**.", ephemeral=True
-        )
-        lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
-        if lobby is not None:
-            await self.render(lobby, bump=False)
-
-    @game_group.command(
-        name="remove", description="Remove a game, its ping list, and any open lobby."
-    )
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def game_remove(self, interaction: discord.Interaction, game: str) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        lobby = await db.get_lobby_for_game(self.bot.db, game_row["id"])
-        await db.remove_lobby_game(self.bot.db, interaction.guild_id, game_row["name"])
-        if lobby is not None:
-            channel = await self._get_channel(lobby["channel_id"])
-            if channel is not None:
-                try:
-                    await channel.get_partial_message(lobby["message_id"]).delete()
-                except discord.HTTPException:
-                    pass
-        await interaction.response.send_message(
-            f"Removed **{game_row['name']}**.", ephemeral=True
-        )
-
-    @game_group.command(name="list", description="List the games set up for lobbies.")
-    async def list_games(self, interaction: discord.Interaction) -> None:
-        games = await db.list_lobby_games(self.bot.db, interaction.guild_id)
-        if not games:
-            message = "No games set up yet."
-        else:
-            message = "\n".join(
-                f"- **{_game_label(game)}** - party of {game['party_size']}, "
-                f"{game['ping_list_size']} on the ping list"
-                for game in games
-            )
-        await interaction.response.send_message(message, ephemeral=True)
-
-    @pinglist_group.command(name="add", description="Add someone to a game's ping list.")
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def pinglist_add(
-        self, interaction: discord.Interaction, user: discord.Member, game: str
-    ) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        added = await db.add_to_ping_list(self.bot.db, game_row["id"], user.id)
-        message = (
-            f"{user.mention} will be pinged for {_game_label(game_row)} lobbies."
-            if added
-            else f"{user.mention} is already on the {_game_label(game_row)} ping list."
-        )
-        await interaction.response.send_message(
-            message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-        )
-
-    @pinglist_group.command(
-        name="remove", description="Take someone off a game's ping list."
-    )
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def pinglist_remove(
-        self, interaction: discord.Interaction, user: discord.Member, game: str
-    ) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        removed = await db.remove_from_ping_list(self.bot.db, game_row["id"], user.id)
-        message = (
-            f"{user.mention} won't be pinged for {_game_label(game_row)} lobbies anymore."
-            if removed
-            else f"{user.mention} isn't on the {_game_label(game_row)} ping list."
-        )
-        await interaction.response.send_message(
-            message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-        )
-
-    @pinglist_group.command(name="show", description="See a game's ping list.")
-    @app_commands.autocomplete(game=game_autocomplete)
-    async def pinglist_show(self, interaction: discord.Interaction, game: str) -> None:
-        game_row = await self._resolve_game(interaction, game)
-        if game_row is None:
-            return
-        user_ids = await db.get_ping_list(self.bot.db, game_row["id"])
-        if not user_ids:
-            message = f"The {_game_label(game_row)} ping list is empty."
-        else:
-            mentions = ", ".join(f"<@{uid}>" for uid in user_ids)
-            message = f"Pinged for {_game_label(game_row)} lobbies: {mentions}"
-        await interaction.response.send_message(
-            message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        await db.log_event(
+            self.bot.db, interaction.guild_id, interaction.user.id,
+            "lobby_close", game["name"],
         )
 
     @commands.Cog.listener()
@@ -856,69 +83,26 @@ class Lobby(commands.Cog):
         # If someone manually deletes a lobby message, drop the lobby with it.
         await db.delete_lobby_by_message(self.bot.db, payload.message_id)
 
-    async def _start_lobby(
-        self,
-        channel: discord.abc.Messageable,
-        guild_id: int,
-        game: aiosqlite.Row,
-        created_by: int,
-    ) -> aiosqlite.Row | None:
-        view, strip = await self._lobby_view(game, [])
-        try:
-            posted = await channel.send(
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-                **({"files": [strip]} if strip else {}),
-            )
-        except discord.HTTPException:
-            return None
-        try:
-            lobby_id = await db.create_lobby(
-                self.bot.db, game["id"], guild_id, channel.id, posted.id, created_by
-            )
-        except sqlite3.IntegrityError:
-            try:
-                await posted.delete()
-            except discord.HTTPException:
-                pass
-            return await db.get_lobby_for_game(self.bot.db, game["id"])
-        await db.log_event(
-            self.bot.db, guild_id, created_by, "lobby_open", game["name"]
-        )
-        return await db.get_lobby(self.bot.db, lobby_id)
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
             return
-        emoji = _parse_emoji(message.content)
+        emoji = parse_emoji(message.content)
         if emoji is None:
             return
-        games = await db.list_lobby_games(self.bot.db, message.guild.id)
-        game = next((g for g in games if g["emoji"] == emoji), None)
+        game = await self.service.game_by_emoji(message.guild.id, emoji)
         if game is None:
             return
         lobby = await db.get_lobby_for_game(self.bot.db, game["id"])
         if lobby is None:
-            lobby = await self._start_lobby(
+            lobby = await self.service.open_lobby(
                 message.channel, message.guild.id, game, message.author.id
             )
             if lobby is None:
                 return
-        added = await db.add_lobby_member(
-            self.bot.db, lobby["id"], message.author.id, message.author.id
+        added = await self.service.add_member(
+            lobby, message.author.id, message.author.id
         )
         if not added:
             return
-        await db.add_lobby_history(
-            self.bot.db, lobby["id"], message.author.id, "join"
-        )
-        await db.log_event(
-            self.bot.db, lobby["guild_id"], message.author.id,
-            "lobby_member_add", f"{lobby['name']}:{message.author.id}",
-        )
-        await self.after_member_change(lobby)
-
-
-async def setup(bot: LeBot) -> None:
-    await bot.add_cog(Lobby(bot))
+        await self.service.after_member_change(lobby)

@@ -60,7 +60,6 @@ class AuditLog(commands.Cog):
         await interaction.response.send_message(
             "\n".join(lines),
             ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @auditlog.autocomplete("event_type")
