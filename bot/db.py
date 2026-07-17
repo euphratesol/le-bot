@@ -143,6 +143,38 @@ async def log_event(
     await db.commit()
 
 
+async def list_events(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int | None = None,
+    event_type: str | None = None,
+    limit: int = 20,
+) -> list[aiosqlite.Row]:
+    """The most recent interaction log entries for a guild, newest first."""
+    async with db.execute(
+        """
+        SELECT user_id, event_type, detail,
+               CAST(strftime('%s', created_at) AS INTEGER) AS ts
+        FROM events
+        WHERE guild_id = ?
+          AND (? IS NULL OR user_id = ?)
+          AND (? IS NULL OR event_type = ?)
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (guild_id, user_id, user_id, event_type, event_type, limit),
+    ) as cursor:
+        return list(await cursor.fetchall())
+
+
+async def list_event_types(db: aiosqlite.Connection, guild_id: int) -> list[str]:
+    async with db.execute(
+        "SELECT DISTINCT event_type FROM events WHERE guild_id = ? ORDER BY event_type",
+        (guild_id,),
+    ) as cursor:
+        return [row[0] for row in await cursor.fetchall()]
+
+
 async def add_lobby_game(
     db: aiosqlite.Connection,
     guild_id: int,
@@ -250,7 +282,8 @@ async def get_ping_list(db: aiosqlite.Connection, game_id: int) -> list[int]:
 
 
 _LOBBY_WITH_GAME = """
-    SELECT l.*, g.name, g.party_size, g.emoji
+    SELECT l.*, g.name, g.party_size, g.emoji,
+           CAST(strftime('%s', l.last_ping_at) AS INTEGER) AS last_ping_ts
     FROM lobbies l
     JOIN lobby_games g ON g.id = l.game_id
 """
@@ -367,6 +400,34 @@ async def list_lobby_members(db: aiosqlite.Connection, lobby_id: int) -> list[in
         (lobby_id,),
     ) as cursor:
         return [row[0] for row in await cursor.fetchall()]
+
+
+async def add_lobby_history(
+    db: aiosqlite.Connection,
+    lobby_id: int,
+    actor_id: int,
+    action: str,
+    target_id: int | None = None,
+) -> None:
+    await db.execute(
+        "INSERT INTO lobby_history (lobby_id, actor_id, target_id, action) "
+        "VALUES (?, ?, ?, ?)",
+        (lobby_id, actor_id, target_id, action),
+    )
+    await db.commit()
+
+
+async def list_lobby_history(
+    db: aiosqlite.Connection, lobby_id: int, limit: int = 5
+) -> list[aiosqlite.Row]:
+    """The most recent history entries for a lobby, newest first."""
+    async with db.execute(
+        "SELECT actor_id, target_id, action, "
+        "CAST(strftime('%s', created_at) AS INTEGER) AS ts "
+        "FROM lobby_history WHERE lobby_id = ? ORDER BY id DESC LIMIT ?",
+        (lobby_id, limit),
+    ) as cursor:
+        return list(await cursor.fetchall())
 
 
 async def mark_lobby_announced(db: aiosqlite.Connection, lobby_id: int) -> bool:

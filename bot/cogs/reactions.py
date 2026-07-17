@@ -51,12 +51,18 @@ class Reactions(commands.Cog):
         if message.author.bot:
             return
 
+        guild_id = message.guild.id if message.guild else 0
+
         prefix = self.bot.command_prefix
         if message.content.startswith(prefix):
             name = message.content[len(prefix):].strip().lower()
             response = self.bot.phrases.command_responses.get(name)
             if response:
                 await self._send_response(message.channel, response)
+                await db.log_event(
+                    self.bot.db, guild_id, message.author.id,
+                    "reaction_command", name,
+                )
             return
 
         if message.channel.id in self.blocked_channels:
@@ -64,6 +70,10 @@ class Reactions(commands.Cog):
         for phrase, response in self.bot.phrases.phrase_responses.items():
             if phrase in message.content.lower():
                 await self._send_response(message.channel, response)
+                await db.log_event(
+                    self.bot.db, guild_id, message.author.id,
+                    "reaction_phrase", phrase,
+                )
                 return
 
     @reactions_group.command(description="Stop phrase reactions in a channel.")
@@ -74,6 +84,10 @@ class Reactions(commands.Cog):
     ) -> None:
         await db.block_reaction_channel(self.bot.db, channel.guild.id, channel.id)
         self.blocked_channels.add(channel.id)
+        await db.log_event(
+            self.bot.db, channel.guild.id, interaction.user.id,
+            "reaction_block", str(channel.id),
+        )
         await interaction.response.send_message(
             f"Phrase reactions are now blocked in {channel.mention}.", ephemeral=True
         )
@@ -86,6 +100,10 @@ class Reactions(commands.Cog):
     ) -> None:
         await db.unblock_reaction_channel(self.bot.db, channel.id)
         self.blocked_channels.discard(channel.id)
+        await db.log_event(
+            self.bot.db, channel.guild.id, interaction.user.id,
+            "reaction_unblock", str(channel.id),
+        )
         await interaction.response.send_message(
             f"Phrase reactions are allowed again in {channel.mention}.", ephemeral=True
         )
