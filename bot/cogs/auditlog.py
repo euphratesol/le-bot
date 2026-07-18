@@ -49,7 +49,7 @@ class AuditLog(commands.Cog):
         for row in rows:
             detail = f" `{row['detail']}`" if row["detail"] else ""
             line = (
-                f"<t:{row['ts']}:R> <@{row['user_id']}> — "
+                f"<t:{row['ts']}:R> <@{row['user_id']}> - "
                 f"**{row['event_type']}**{detail}"
             )
             if length + len(line) + 1 > MAX_MESSAGE_LEN:

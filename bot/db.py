@@ -443,3 +443,111 @@ async def touch_lobby_ping(db: aiosqlite.Connection, lobby_id: int) -> None:
         "UPDATE lobbies SET last_ping_at = datetime('now') WHERE id = ?", (lobby_id,)
     )
     await db.commit()
+
+
+async def add_wordle_score(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int,
+    day: str,
+    guesses: int | None,
+    crowned: bool,
+) -> bool:
+    """Record a user's score for a puzzle day. False if already recorded."""
+    cursor = await db.execute(
+        """
+        INSERT INTO wordle_scores (guild_id, user_id, day, guesses, crowned)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (guild_id, day, user_id) DO NOTHING
+        """,
+        (guild_id, user_id, day, guesses, int(crowned)),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+_WORDLE_AGGREGATES = """
+    count(*) AS games,
+    sum(crowned) AS crowns,
+    sum(guesses IS NULL) AS fails,
+    round(avg(coalesce(guesses, 7)), 2) AS average
+"""
+
+
+async def wordle_leaderboard(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    since_day: str | None = None,
+) -> list[aiosqlite.Row]:
+    """Scores aggregated per user. Failed puzzles (X/6) average as 7 guesses."""
+    async with db.execute(
+        f"""
+        SELECT user_id, {_WORDLE_AGGREGATES}
+        FROM wordle_scores
+        WHERE guild_id = ?
+          AND (? IS NULL OR day >= ?)
+        GROUP BY user_id
+        ORDER BY crowns DESC, average, games DESC
+        """,
+        (guild_id, since_day, since_day),
+    ) as cursor:
+        return list(await cursor.fetchall())
+
+
+async def wordle_user_stats(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int,
+) -> aiosqlite.Row:
+    """One user's aggregate scores; `games` is 0 if they have none."""
+    async with db.execute(
+        f"""
+        SELECT {_WORDLE_AGGREGATES}
+        FROM wordle_scores
+        WHERE guild_id = ? AND user_id = ?
+        """,
+        (guild_id, user_id),
+    ) as cursor:
+        return await cursor.fetchone()
+
+
+async def set_wordle_channel(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+) -> None:
+    """Track the channel recaps arrive in and the newest recap processed.
+
+    Message IDs are snowflakes (time-ordered), so max() keeps the pointer
+    moving forward even when a backfill visits old messages."""
+    await db.execute(
+        """
+        INSERT INTO wordle_channels (guild_id, channel_id, last_message_id)
+        VALUES (?, ?, ?)
+        ON CONFLICT (guild_id) DO UPDATE
+        SET channel_id = excluded.channel_id,
+            last_message_id = max(last_message_id, excluded.last_message_id)
+        """,
+        (guild_id, channel_id, message_id),
+    )
+    await db.commit()
+
+
+async def list_wordle_channels(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    async with db.execute("SELECT * FROM wordle_channels") as cursor:
+        return list(await cursor.fetchall())
+
+
+async def wordle_guess_distribution(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int,
+) -> dict[int | None, int]:
+    """Games per guess count; the None key counts failed puzzles."""
+    async with db.execute(
+        "SELECT guesses, count(*) FROM wordle_scores "
+        "WHERE guild_id = ? AND user_id = ? GROUP BY guesses",
+        (guild_id, user_id),
+    ) as cursor:
+        return {row[0]: row[1] for row in await cursor.fetchall()}

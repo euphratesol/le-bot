@@ -15,6 +15,7 @@ INITIAL_EXTENSIONS = [
     "bot.cogs.general",
     "bot.cogs.lobby",
     "bot.cogs.reactions",
+    "bot.cogs.wordle",
 ]
 
 
