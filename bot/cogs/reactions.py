@@ -54,8 +54,9 @@ class Reactions(commands.Cog):
         guild_id = message.guild.id if message.guild else 0
 
         prefix = self.bot.command_prefix
-        if message.content.startswith(prefix):
-            name = message.content[len(prefix):].strip().lower()
+        text = message.content.strip()
+        if text.startswith(prefix):
+            name = text[len(prefix):].strip().lower()
             response = self.bot.phrases.command_responses.get(name)
             if response:
                 await self._send_response(message.channel, response)
@@ -118,7 +119,7 @@ class Reactions(commands.Cog):
         else:
             mentions = ", ".join(f"<#{cid}>" for cid in channel_ids)
             message = f"Phrase reactions are blocked in {mentions}"
-        await interaction.response.send_message(message, ephemeral=True  )
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 async def setup(bot: LeBot) -> None:

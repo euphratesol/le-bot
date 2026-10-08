@@ -111,7 +111,7 @@ class LobbyControls(discord.ui.ActionRow):
             return
         await self.service.clear_members(lobby, interaction.user.id)
         await interaction.response.defer()
-        await self.service.render(lobby, bump=True)
+        await self.service.after_member_change(lobby)
 
 
 class LobbyLayout(discord.ui.LayoutView):
@@ -159,6 +159,8 @@ class LobbyLayout(discord.ui.LayoutView):
                     what = f"<@{actor}> removed <@{target}>"
                 case "clear":
                     what = f"<@{actor}> cleared the lobby"
+                case "ping":
+                    what = f"<@{actor}> pinged the ping list"
                 case action:
                     what = f"<@{actor}> {action}"
             lines.append(f"-# {what} · <t:{entry['ts']}:R>")

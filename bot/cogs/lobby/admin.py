@@ -173,7 +173,7 @@ class GameAdmin(commands.Cog):
             f"Removed {user.mention} from the {game_label(lobby)} lobby.",
             ephemeral=True,
         )
-        await self.service.render(lobby, bump=True)
+        await self.service.after_member_change(lobby)
 
     @pinglist_group.command(name="add", description="Add someone to a game's ping list.")
     async def pinglist_add(

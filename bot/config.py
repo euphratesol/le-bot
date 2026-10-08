@@ -26,7 +26,7 @@ class Response:
 
 def _parse_response(value: str | dict) -> Response:
     """A response in phrases.json is either a plain string (text only)
-    or an object with option "text" and "image" keys."""
+    or an object with optional "text" and "image" keys."""
     if isinstance(value, str):
         return Response(text=value)
     return Response(text=value.get("text"), image=value.get("image"))
@@ -69,11 +69,10 @@ def load_config() -> Config:
             "DISCORD_TOKEN is not set. Copy .env.example to .env and add your bot token."
         )
 
-
     return Config(
         token=token,
         guild_ids=_parse_id_list(os.getenv("GUILD_IDS", "")),
-        db_path=os.getenv("DB_PATH", "data/bot.db"),
-        phrases_path=os.getenv("PHRASES_PATH", "phrases.json"),
-        images_path=os.getenv("IMAGES_PATH", "images"),
+        db_path=os.getenv("DB_PATH", Config.db_path),
+        phrases_path=os.getenv("PHRASES_PATH", Config.phrases_path),
+        images_path=os.getenv("IMAGES_PATH", Config.images_path),
     )

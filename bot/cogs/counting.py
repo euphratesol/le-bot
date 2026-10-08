@@ -22,9 +22,10 @@ class Counting(commands.Cog):
         guild_id = message.guild.id if message.guild else 0
 
         prefix = self.bot.command_prefix
-        phrase = message.content.strip().lower()
-        if message.content.startswith(prefix):
-            phrase = phrase[len(prefix):]
+        text = message.content.strip()
+        phrase = text.lower()
+        if text.startswith(prefix):
+            phrase = text[len(prefix):].strip().lower()
             if phrase in self.bot.phrases.counted_phrases:
                 count = await db.get_counter(
                     self.bot.db,

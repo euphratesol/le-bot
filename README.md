@@ -5,8 +5,15 @@ A small Discord bot for a few private servers, built with [discord.py](https://d
 Current features:
 
 - Slash commands (synced instantly to the servers in `GUILD_IDS`)
-- Phrase reactions - replies when messages contain configured trigger words
-- Per-user, per-server counters and an interaction log, stored in SQLite
+- Phrase reactions - replies (text and/or image) when messages contain
+  configured trigger words; `/reactions block|unblock|blocked` turns them off
+  per channel
+- Phrase counters - silently counts configured phrases per user; `n!<phrase>`
+  shows your count
+- Game lobbies - `/lobby open|close`, Join/Leave/Ping/Clear buttons, an avatar
+  strip and a history card. Posting a game's emoji opens/joins its lobby.
+  Admins configure games, ping lists and members with `/game ...`
+- Interaction log in SQLite, browsable by admins with `/auditlog`
 
 ## Requirements
 
@@ -37,8 +44,9 @@ Current features:
 3. Copy `phrases.example.json` to `phrases.json` and configure the phrases
    the bot reacts to, counts, and answers as `n!` commands. Like any `.env`,
    this file stays out of git - edit it freely per machine and restart the
-   bot to apply changes.
- 
+   bot to apply changes. Images referenced by a response (`"image": "doge.png"`)
+   are loaded from `images/` (also gitignored).
+
 4. Run the bot:
 
    ```sh
@@ -54,11 +62,31 @@ bot/
 ├── config.py     # loads .env into a Config object
 ├── db.py         # SQLite connection, migration runner, query helpers
 ├── migrations/   # numbered, forward-only SQL migration files
-└── cogs/         # one module per feature area
+└── cogs/         # one module (or package) per feature area
+    ├── auditlog.py, counting.py, general.py, reactions.py
+    └── lobby/
+        ├── cog.py      # /lobby commands, emoji trigger, message-delete cleanup
+        ├── admin.py    # /game commands (games, ping lists, lobby members)
+        ├── service.py  # lobby state, debounced rendering, open/move/close
+        ├── views.py    # lobby message layout and buttons
+        ├── options.py  # slash-command option transformers and errors
+        └── avatars.py  # avatar strip image
 ```
 
-Each feature lives in its own cog module under `bot/cogs/`. To add one,
-create the module and register it in `INITIAL_EXTENSIONS` in `bot/main.py`.
+Each feature lives in its own cog under `bot/cogs/`. To add one, create the
+module and register it in `INITIAL_EXTENSIONS` in `bot/main.py`.
+
+## Configuration
+
+All settings come from `.env` (see `.env.example`):
+
+| Variable       | Default        | Purpose                                  |
+| -------------- | -------------- | ---------------------------------------- |
+| `DISCORD_TOKEN`| -              | Bot token (required)                     |
+| `GUILD_IDS`    | empty (global) | Servers to sync slash commands to        |
+| `DB_PATH`      | `data/bot.db`  | SQLite database file                     |
+| `PHRASES_PATH` | `phrases.json` | Phrase reaction/counter config           |
+| `IMAGES_PATH`  | `images`       | Folder for phrase response images        |
 
 ## Database
 

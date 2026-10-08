@@ -35,34 +35,29 @@ class Lobby(commands.Cog):
 
     @lobby_group.command(description="Open the lobby for a game (or bring it here).")
     async def open(self, interaction: discord.Interaction, game: GameOption) -> None:
+        # Moving a lobby can wait on an in-flight render and download avatars,
+        # which can miss Discord's 3s reply deadline - acknowledge first.
+        await interaction.response.defer(ephemeral=True)
         lobby = await db.get_lobby_for_game(self.bot.db, game["id"])
-        if lobby is not None:
-            # Move the existing lobby here, members intact.
-            async def send(
-                view: LobbyLayout, strip: discord.File | None
-            ) -> discord.Message:
-                await interaction.response.send_message(
-                    view=view, **({"files": [strip]} if strip else {})
-                )
-                return await interaction.original_response()
-
-            await self.service.move_lobby_message(lobby, send)
-            await db.log_event(
-                self.bot.db, interaction.guild_id, interaction.user.id,
-                "lobby_move", game["name"],
+        if lobby is None:
+            lobby = await self.service.open_lobby(
+                interaction.channel, interaction.guild_id, game, interaction.user.id
             )
-            return
-
-        view, strip = await self.service.lobby_view(game, [])
-        await interaction.response.send_message(
-            view=view, **({"files": [strip]} if strip else {})
+            posted = lobby is not None
+        else:
+            # Move the existing lobby here, members intact.
+            posted = await self.service.move_lobby_message(lobby, interaction.channel)
+            if posted:
+                await db.log_event(
+                    self.bot.db, interaction.guild_id, interaction.user.id,
+                    "lobby_move", game["name"],
+                )
+        await interaction.followup.send(
+            f"The {game_label(game)} lobby is up."
+            if posted
+            else "I couldn't post the lobby in this channel.",
+            ephemeral=True,
         )
-        message = await interaction.original_response()
-        winner, created = await self.service.claim_lobby_message(
-            game, interaction.guild_id, message, interaction.user.id
-        )
-        if not created and winner is not None:
-            await self.service.render(winner, bump=True)
 
     @lobby_group.command(description="Close a game's lobby.")
     async def close(self, interaction: discord.Interaction, game: GameOption) -> None:

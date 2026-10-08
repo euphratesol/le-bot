@@ -81,11 +81,7 @@ async def get_counter(
     name: str,
 ) -> int:
     async with db.execute(
-        """SELECT value 
-           FROM counters 
-           WHERE guild_id = ? 
-             AND user_id = ? 
-             AND name = ?""",
+        "SELECT value FROM counters WHERE guild_id = ? AND user_id = ? AND name = ?",
         (guild_id, user_id, name),
     ) as cursor:
         row = await cursor.fetchone()
@@ -99,9 +95,9 @@ async def get_reaction_blocked_channels(db: aiosqlite.Connection) -> set[int]:
 
 
 async def block_reaction_channel(
-        db: aiosqlite.Connection,
-        guild_id: int,
-        channel_id: int,
+    db: aiosqlite.Connection,
+    guild_id: int,
+    channel_id: int,
 ) -> None:
     await db.execute(
         "INSERT OR IGNORE INTO reaction_blocked_channels (channel_id, guild_id) VALUES (?, ?)",
@@ -118,12 +114,12 @@ async def unblock_reaction_channel(db: aiosqlite.Connection, channel_id: int) ->
 
 
 async def list_reaction_blocked_channels(
-        db: aiosqlite.Connection,
-        guild_id: int,
+    db: aiosqlite.Connection,
+    guild_id: int,
 ) -> list[int]:
     async with db.execute(
         "SELECT channel_id FROM reaction_blocked_channels WHERE guild_id = ?",
-        (guild_id,)
+        (guild_id,),
     ) as cursor:
         return [row[0] for row in await cursor.fetchall()]
 
@@ -390,7 +386,6 @@ async def remove_lobby_member(
 
 async def clear_lobby_members(db: aiosqlite.Connection, lobby_id: int) -> None:
     await db.execute("DELETE FROM lobby_members WHERE lobby_id = ?", (lobby_id,))
-    await db.execute("UPDATE lobbies SET announced = 0 WHERE id = ?", (lobby_id,))
     await db.commit()
 
 
@@ -430,9 +425,15 @@ async def list_lobby_history(
         return list(await cursor.fetchall())
 
 
-async def mark_lobby_announced(db: aiosqlite.Connection, lobby_id: int) -> bool:
+async def set_lobby_announced(
+    db: aiosqlite.Connection,
+    lobby_id: int,
+    announced: bool,
+) -> bool:
+    """Set the lobby's full-party flag. True only if the value changed."""
     cursor = await db.execute(
-        "UPDATE lobbies SET announced = 1 WHERE id = ? AND announced = 0", (lobby_id,)
+        "UPDATE lobbies SET announced = ? WHERE id = ? AND announced != ?",
+        (announced, lobby_id, announced),
     )
     await db.commit()
     return cursor.rowcount > 0

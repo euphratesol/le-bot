@@ -2,7 +2,6 @@ import asyncio
 import sqlite3
 import time
 import weakref
-from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 import aiosqlite
@@ -155,24 +154,27 @@ class LobbyService:
         )
 
     async def after_member_change(self, lobby: aiosqlite.Row) -> None:
-        """Announce a filled party (once), then redraw/bump the lobby."""
+        """Announce a filled party (once per fill), then redraw/bump the lobby.
+
+        Dropping below full re-arms the announcement for the next fill.
+        """
         members = await db.list_lobby_members(self.db, lobby["id"])
-        if len(members) >= lobby["party_size"]:
-            if await db.mark_lobby_announced(self.db, lobby["id"]):
-                channel = await self.get_channel(lobby["channel_id"])
-                if channel is not None:
-                    mentions = " ".join(f"<@{uid}>" for uid in members)
-                    try:
-                        await channel.send(
-                            f"The {game_label(lobby)} lobby is full: {mentions}",
-                            allowed_mentions=discord.AllowedMentions(users=True),
-                        )
-                    except discord.HTTPException:
-                        pass
-                await db.log_event(
-                    self.db, lobby["guild_id"], lobby["created_by"],
-                    "lobby_full", lobby["name"],
-                )
+        full = len(members) >= lobby["party_size"]
+        if await db.set_lobby_announced(self.db, lobby["id"], full) and full:
+            channel = await self.get_channel(lobby["channel_id"])
+            if channel is not None:
+                mentions = " ".join(f"<@{uid}>" for uid in members)
+                try:
+                    await channel.send(
+                        f"The {game_label(lobby)} lobby is full: {mentions}",
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                except discord.HTTPException:
+                    pass
+            await db.log_event(
+                self.db, lobby["guild_id"], lobby["created_by"],
+                "lobby_full", lobby["name"],
+            )
         await self.render(lobby, bump=True)
 
     # -- pings --------------------------------------------------------------
@@ -204,7 +206,8 @@ class LobbyService:
         actor_id: int,
         targets: list[int],
     ) -> None:
-        """Mention the targets in chunks, then stamp the cooldown and log."""
+        """Mention the targets in chunks, then stamp the cooldown, log, and
+        add the ping to the lobby's history card."""
         mentions = [f"<@{uid}>" for uid in targets]
         while mentions:
             chunk, mentions = (
@@ -215,9 +218,11 @@ class LobbyService:
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
         await db.touch_lobby_ping(self.db, lobby["id"])
+        await db.add_lobby_history(self.db, lobby["id"], actor_id, "ping")
         await db.log_event(
             self.db, lobby["guild_id"], actor_id, "lobby_ping", lobby["name"]
         )
+        await self.render(lobby, bump=False)
 
     # -- rendering ----------------------------------------------------------
 
@@ -238,11 +243,15 @@ class LobbyService:
         )
         lock = self._render_lock(lobby_id)
         if lock.locked():
-            return  # the in-flight render's loop will pick this up
+            return  # the lock holder drains pending renders before releasing
         async with lock:
-            while lobby_id in self._render_pending:
-                bump_now = self._render_pending.pop(lobby_id)
-                await self._render_once(lobby_id, bump=bump_now)
+            await self._drain_renders(lobby_id)
+
+    async def _drain_renders(self, lobby_id: int) -> None:
+        """Run queued redraws until none are left. Caller holds the lock."""
+        while lobby_id in self._render_pending:
+            bump = self._render_pending.pop(lobby_id)
+            await self._render_once(lobby_id, bump=bump)
 
     async def _render_once(self, lobby_id: int, *, bump: bool) -> None:
         # Re-fetch inside the lock: a previous pass (or /lobby open) may
@@ -289,34 +298,6 @@ class LobbyService:
 
     # -- lobby lifecycle ----------------------------------------------------
 
-    async def claim_lobby_message(
-        self,
-        game: aiosqlite.Row,
-        guild_id: int,
-        message: discord.Message,
-        created_by: int,
-    ) -> tuple[aiosqlite.Row | None, bool]:
-        """Record a just-sent message as the game's lobby.
-
-        On losing the unique-lobby race (someone opened this game's lobby at
-        the same moment), delete our message instead of stranding a duplicate
-        and return the winner's row with created=False; the caller decides
-        whether the winner needs a redraw.
-        """
-        try:
-            lobby_id = await db.create_lobby(
-                self.db, game["id"], guild_id, message.channel.id, message.id,
-                created_by,
-            )
-        except sqlite3.IntegrityError:
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                pass
-            return await db.get_lobby_for_game(self.db, game["id"]), False
-        await db.log_event(self.db, guild_id, created_by, "lobby_open", game["name"])
-        return await db.get_lobby(self.db, lobby_id), True
-
     async def open_lobby(
         self,
         channel: discord.abc.Messageable,
@@ -324,7 +305,12 @@ class LobbyService:
         game: aiosqlite.Row,
         created_by: int,
     ) -> aiosqlite.Row | None:
-        """Post a fresh lobby message for the game and record it."""
+        """Post a fresh lobby message for the game and record it.
+
+        On losing the unique-lobby race (someone opened this game's lobby at
+        the same moment), delete our message instead of stranding a duplicate
+        and return the winner's row. None if the message couldn't be posted.
+        """
         view, strip = await self.lobby_view(game, [])
         try:
             posted = await channel.send(
@@ -332,35 +318,49 @@ class LobbyService:
             )
         except discord.HTTPException:
             return None
-        lobby, _ = await self.claim_lobby_message(game, guild_id, posted, created_by)
-        return lobby
+        try:
+            lobby_id = await db.create_lobby(
+                self.db, game["id"], guild_id, channel.id, posted.id, created_by
+            )
+        except sqlite3.IntegrityError:
+            try:
+                await posted.delete()
+            except discord.HTTPException:
+                pass
+            return await db.get_lobby_for_game(self.db, game["id"])
+        await db.log_event(self.db, guild_id, created_by, "lobby_open", game["name"])
+        return await db.get_lobby(self.db, lobby_id)
 
     async def move_lobby_message(
-        self,
-        lobby: aiosqlite.Row,
-        send: Callable[[LobbyLayout, discord.File | None], Awaitable[discord.Message]],
-    ) -> None:
-        """Move the lobby to a newly sent message, members intact.
+        self, lobby: aiosqlite.Row, channel: discord.abc.Messageable
+    ) -> bool:
+        """Move the lobby to a new message in channel, members intact.
 
         Holds the render lock across the send so a concurrent member-change
         redraw can't also replace the message and strand a duplicate.
+        Returns False if the new message couldn't be posted.
         """
         async with self._render_lock(lobby["id"]):
             lobby = await db.get_lobby(self.db, lobby["id"]) or lobby
             members = await db.list_lobby_members(self.db, lobby["id"])
             history = await db.list_lobby_history(self.db, lobby["id"])
             view, strip = await self.lobby_view(lobby, members, history)
-            message = await send(view, strip)
-            old_channel_id, old_message_id = (
-                lobby["channel_id"], lobby["message_id"]
-            )
-            await db.move_lobby(self.db, lobby["id"], message.channel.id, message.id)
-            old_channel = await self.get_channel(old_channel_id)
+            try:
+                message = await channel.send(
+                    view=view, **({"files": [strip]} if strip else {})
+                )
+            except discord.HTTPException:
+                return False
+            await db.move_lobby(self.db, lobby["id"], channel.id, message.id)
+            old_channel = await self.get_channel(lobby["channel_id"])
             if old_channel is not None:
                 try:
-                    await old_channel.get_partial_message(old_message_id).delete()
+                    await old_channel.get_partial_message(lobby["message_id"]).delete()
                 except discord.HTTPException:
                     pass
+            # Renders requested while we held the lock were skipped; run them.
+            await self._drain_renders(lobby["id"])
+        return True
 
     async def close_lobby(self, lobby: aiosqlite.Row) -> None:
         """Delete the lobby and swap its message for a closed card."""
